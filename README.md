@@ -10,20 +10,20 @@ It supports [Niri](https://github.com/YaLTeR/niri) with [DankMaterialShell](http
   - **Everything is plain text you can inspect.** The tool is one Bash script and a small DMS plugin. Each app gets one directory, one menu entry and one small JSON record.
   - **No new package format, store or database.** The AppImages themselves aren't modified.
 - **Lightweight:**
-  - **Nothing runs in the background.** Updates are checked once at login by a short systemd job.
+  - **Nothing runs in the background.** Updates are checked by short jobs that run at login and when an app starts.
   - **No extra processes when idle.** Progress is shown by the shell you already run.
   - **No new dependencies to speak of:** it uses tools that are normally already installed, like `curl`, `jq` and `notify-send`.
 - **Easy to use:**
   - **Install:** one command, `installappimage Foo.AppImage`. It sets up the menu entry and icon, and finds where updates come from or asks you once.
-  - **Updates:** you hear about an update when you open the app, and one click installs it with progress in the bar.
+  - **Updates:** every app start checks for one, you hear about it while the app opens, and one click installs it with progress in the bar.
   - **Install and remove the tool:** a guided `./install.sh` sets it up. `./install.sh --uninstall` removes it and leaves your apps working.
 
 ## What it does
 
 - **Install:** moves the AppImage to `~/Applications/<id>/<id>.AppImage` (the base directory can be changed) and extracts its menu entry and icon. The menu entry starts the app through `installappimage --run <id>`.
 - **Update info:** reads the update information embedded in the AppImage. If there is none, it asks where updates are published: a GitHub repository, an Electron update feed (`latest-linux.yml`) or a `.zsync` URL.
-- **Login check:** a systemd user service checks every app for updates when you log in.
-- **Launch:** if an update is available, launching the app shows a notification with **Update now** and **Dismiss**. Clicking **Update now**, or the notification itself, starts the update.
+- **Update checks:** each app is checked for updates every time it starts, in the background, so the app isn't slowed down. A systemd user service also checks every app when you log in.
+- **Launch:** if an update is available, a notification with **Update now** and **Dismiss** appears when the app starts, or as soon as the check finds the update. Clicking **Update now**, or the notification itself, starts the update. It appears on every launch until the app is updated, but an open one isn't duplicated.
 - **Progress:** a DMS bar plugin shows each update's progress, current step and log lines, with **Retry** on failures. Without the plugin, updates open in a terminal window instead.
 - **When it ends:** a notification reports the result. A failure includes the reason, with **Show log** and **Retry** buttons. Once every update has succeeded, the bar pill disappears after 3 seconds.
 
@@ -132,7 +132,7 @@ installappimage --help
 | `~/.local/state/installappimage/backup/` | Menu entries replaced at install |
 | `~/.config/systemd/user/installappimage-check.service` | Login update check |
 
-**Systemd units:** updates run as the transient unit `installappimage-update-<id>`. Notifications that wait for a click run as `installappimage-notify-update-<id>` and `installappimage-notify-result-<id>`.
+**Systemd units:** updates run as the transient unit `installappimage-update-<id>`, and the check at app start as `installappimage-launch-check-<id>`. Notifications that wait for a click run as `installappimage-notify-update-<id>` and `installappimage-notify-result-<id>`.
 
 ## DMS plugin
 
@@ -147,7 +147,7 @@ installappimage --help
 
 - **Updates always download the whole file.** Arch's `zsync` (0.6) only supports HTTP, and GitHub serves HTTPS only. `.zsync` files are still used to detect new versions and verify downloads.
 - **Type 1 AppImages are not supported.**
-- **Launching the `.AppImage` directly** (not through the menu entry) skips the update notification.
+- **Launching the `.AppImage` directly** (not through the menu entry) skips the update check and notification.
 - **Running the script from inside another AppImage** (for example, a terminal packaged as one) passes that AppImage's libraries on. The script strips `/.mount_*` entries from `LD_LIBRARY_PATH`, `LD_PRELOAD` and `PATH` before running anything.
 
 ## License

@@ -69,7 +69,8 @@ Usage:
                                   remove apps (--purge also offers to delete their data dirs)
   $PROG --update ID... | all [--ui auto|tty|none]
                                   update some or all apps
-  $PROG --check                   check every app for updates (run at login)
+  $PROG --check                   check every app for updates (also run at login;
+                                  each app is also checked when it starts)
   $PROG --config [install_dir DIR | terminal COMMAND]
                                   show the config, or change a setting
   $PROG --setup [--no-login-check]
@@ -687,25 +688,37 @@ notify_wait() { # kind id icon timeout summary body [action=Label...]
     if [[ -n $icon ]]; then args+=(-i "$icon"); fi
     for a; do args+=(-A "$a"); done
     mkdir -p "$NOTIFY_DIR"
-    while IFS= read -r line; do
-        if ((first)); then
-            first=0 nid=$line
-            printf '%s\n' "$nid" >"$nidf"
-        else
-            action=$line
-        fi
-    done < <(notify-send "${args[@]}" -- "$summary" "$body" 2>/dev/null)
-    if [[ -f $nidf && $(<"$nidf") == "$nid" ]]; then rm -f -- "$nidf"; fi
+    local attempt started
+    for attempt in 1 2; do
+        first=1 nid='' action='' started=$SECONDS
+        while IFS= read -r line; do
+            if ((first)); then
+                first=0 nid=$line
+                printf '%s\n' "$nid" >"$nidf"
+            else
+                action=$line
+            fi
+        done < <(notify-send "${args[@]}" -- "$summary" "$body" 2>/dev/null)
+        if [[ -f $nidf && $(<"$nidf") == "$nid" ]]; then rm -f -- "$nidf"; fi
+        # DMS drops a notification identical to one shown in the last 5 s
+        # (it closes it at once). Closed within a second and not clicked:
+        # most likely that, so show it again once the window has passed.
+        if [[ -n $action || $attempt == 2 ]] || ((SECONDS - started > 1)); then break; fi
+        sleep 5.5
+    done
     printf '%s' "$action"
 }
 
 # Runs "$SELF ARGS..." as transient user unit installappimage-notify-<kind>-<id>
-# (never installappimage-update-<id>, which is the update itself),
-# replacing any notification of the same kind still on screen.
+# (never installappimage-update-<id>, which is the update itself). An "update
+# available" notification that is still open is kept as it is: replacing it
+# with an identical one would be dropped by DMS's duplicate filter. A result
+# notification replaces the previous one.
 spawn_notifier() { # kind id args...
     local kind=$1 id=$2 unit i
     shift 2
     unit=installappimage-notify-$kind-$id
+    if [[ $kind == update ]] && systemctl --user is-active --quiet "$unit"; then return 0; fi
     close_notification "$NOTIFY_DIR/$kind-$id.nid"
     for i in {1..20}; do
         systemctl --user is-active --quiet "$unit" || break
@@ -1287,11 +1300,44 @@ cmd_run() {
         notify-send -a "$NOTIFY_APP" "Can't start $id" "$app is missing." 2>/dev/null || true
         exit 1
     fi
-    if [[ -f $PENDING_DIR/$id ]]; then
-        (spawn_notifier update "$id" --_notify-update "$id") </dev/null >/dev/null 2>&1 &
-        disown
-    fi
+    # Notify about a known update and check for a new one, without delaying
+    # the app: the check runs as its own user unit.
+    # If the unit already exists, a check from a moment ago is still running.
+    (systemd-run --user --collect --quiet --unit="installappimage-launch-check-$id" -- \
+        "$SELF" --_launch-check "$id" || true) </dev/null >/dev/null 2>&1 &
+    disown
     exec "$app" "$@"
+}
+
+# Run on every app start: shows the notification for an update already found,
+# then checks this app for updates and notifies if a new one turns up.
+cmd_launch_check() {
+    local id=$1 info had_pending=0 lockfd
+    [[ -f $(reg_file "$id") ]] || return 0
+    if [[ -f $PENDING_DIR/$id ]]; then
+        had_pending=1
+        spawn_notifier update "$id" --_notify-update "$id"
+    fi
+    info=$(reg_get "$id" .update_info)
+    [[ -n $info ]] || return 0
+    # Skip while this app is being updated.
+    mkdir -p "$LOCK_DIR"
+    exec {lockfd}>"$LOCK_DIR/$id.lock"
+    flock -n "$lockfd" || return 0
+    flock -u "$lockfd"
+    if ! resolve_target "$info"; then
+        warn "$id: $REASON"
+        return 0
+    fi
+    local_hashes "$id"
+    if is_current "$id"; then
+        # Up to date, e.g. the app updated itself: drop a stale notice.
+        rm -f -- "$PENDING_DIR/$id"
+        close_notification "$NOTIFY_DIR/update-$id.nid"
+        return 0
+    fi
+    mark_pending "$id" "$(target_label)"
+    if ((had_pending == 0)); then spawn_notifier update "$id" --_notify-update "$id"; fi
 }
 
 cmd_config() {
@@ -1403,6 +1449,7 @@ main() {
         --setup) shift; cmd_setup "$@" ;;
         --_detach-menu) relink_menu_entries detach ;;
         --_notify-update) cmd_notify_update "$2" ;;
+        --_launch-check) cmd_launch_check "$2" ;;
         --_notify-result) cmd_notify_result "$2" "$3" "$4" ;;
         '') usage >&2; exit 1 ;;
         -*) die "unknown option: $1 (see $PROG --help)" ;;
