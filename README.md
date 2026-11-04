@@ -109,3 +109,7 @@ installappimage.sh --help
 - **Type 1 AppImages are not supported.**
 - **Launching the `.AppImage` directly** (not through the menu entry) skips the update notification.
 - **Running the script from inside another AppImage** (for example, a terminal packaged as one) passes that AppImage's libraries on. The script strips `/.mount_*` entries from `LD_LIBRARY_PATH`, `LD_PRELOAD` and `PATH` before running anything.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
