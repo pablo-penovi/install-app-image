@@ -1,0 +1,1317 @@
+#!/usr/bin/env bash
+#
+# installappimage.sh: install AppImages with a menu entry, list and remove
+# them, and keep them up to date. Run with --help for usage.
+#
+# Where things live:
+#   config    $XDG_CONFIG_HOME/installappimage/config         (INSTALL_DIR=...)
+#   registry  $XDG_DATA_HOME/installappimage/apps/<id>.json   (one per app)
+#   apps      $INSTALL_DIR/<id>/<id>.AppImage                  (default ~/Applications)
+#   state     $XDG_STATE_HOME/installappimage/
+#               updates/<id>        an update is available (written by --check)
+#               progress/<id>.json  live update progress, shown by the DMS plugin
+#               logs/<id>.log       log of the last update
+#
+# The DMS plugin "installAppImage" (~/.config/DankMaterialShell/plugins/)
+# renders progress/<id>.json in the bar. Without it, updates started from a
+# notification run in a Ghostty window instead.
+
+set -Eeuo pipefail
+shopt -s nullglob
+trap 'LAST_ERR="line $LINENO: $BASH_COMMAND"' ERR
+
+SELF=$(realpath -- "${BASH_SOURCE[0]}")
+readonly SELF PROG=${0##*/}
+
+: "${HOME:?HOME is not set}"
+readonly CONFIG_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/installappimage/config
+readonly REG_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/installappimage/apps
+readonly ICON_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/icons/installappimage
+readonly DESKTOP_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/installappimage
+readonly PENDING_DIR=$STATE_DIR/updates
+readonly PROGRESS_DIR=$STATE_DIR/progress
+readonly LOG_DIR=$STATE_DIR/logs
+readonly LOCK_DIR=$STATE_DIR/locks
+readonly NOTIFY_DIR=$STATE_DIR/notify
+readonly BACKUP_DIR=$STATE_DIR/backup
+readonly TMP_BASE=${XDG_CACHE_HOME:-$HOME/.cache}/installappimage
+readonly UNIT_NAME=installappimage-check.service
+readonly UNIT_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT_NAME
+readonly PLUGIN_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/DankMaterialShell/plugins/installAppImage
+readonly DEFAULT_INSTALL_DIR=$HOME/Applications
+readonly NOTIFY_APP="AppImage Updates"
+
+if [[ -t 2 ]]; then
+    C_B=$'\e[1m' C_R=$'\e[31m' C_Y=$'\e[33m' C_G=$'\e[32m' C_D=$'\e[2m' C_0=$'\e[0m'
+else
+    C_B='' C_R='' C_Y='' C_G='' C_D='' C_0=''
+fi
+
+info() { printf '%s==>%s %s\n' "$C_B" "$C_0" "$*" >&2; }
+note() { printf '    %s\n' "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die() {
+    printf '%serror:%s %s\n' "$C_R" "$C_0" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROG FILE.AppImage [--name ID] [--dir DIR] [--repo OWNER/REPO | --update-url URL | --no-update-info] [-y]
+                                  install an AppImage
+  $PROG --list                    list AppImages installed with this script
+  $PROG --remove ID... [--purge] [-y]
+                                  remove apps (--purge also offers to delete their data dirs)
+  $PROG --update ID... | all [--ui auto|tty|none]
+                                  update some or all apps
+  $PROG --check                   check every app for updates (run at login)
+  $PROG --config [install_dir DIR]
+                                  show the config, or set where apps are installed
+  $PROG --setup                   install and enable the login update check
+
+Install options:
+  --name ID          id for the app (default: its name, lowercased)
+  --dir DIR          install under DIR instead of the configured directory
+  --repo OWNER/REPO  get updates from this GitHub repository's releases
+                     (also accepts a github.com URL); overrides embedded update info
+  --update-url URL   get updates from an Electron update feed (.../latest-linux.yml)
+                     or a .zsync file; overrides embedded update info
+  --no-update-info   don't ask for an update source when the AppImage has no update info
+  -y, --yes          don't ask before replacing existing menu entries
+
+Update options:
+  --ui auto   show progress in this terminal, else in the DMS bar plugin,
+              else in a new Ghostty window (default)
+  --ui tty    print progress here
+  --ui none   no terminal output; progress goes to the DMS plugin and the log
+EOF
+}
+
+# --- environment -------------------------------------------------------------
+
+# A parent process that is itself an AppImage (a terminal, an editor) passes on
+# its bundled library path; system tools and other AppImages then load the
+# wrong libraries. Drop every entry that points into an AppImage mount.
+sanitize_env() {
+    local var part out
+    local -a parts
+    for var in LD_LIBRARY_PATH LD_PRELOAD PATH; do
+        [[ -n ${!var-} ]] || continue
+        out=''
+        IFS=': ' read -ra parts <<<"${!var}"
+        for part in "${parts[@]}"; do
+            if [[ -n $part && $part != */.mount_* ]]; then
+                out+=${out:+:}$part
+            fi
+        done
+        if [[ -n $out ]]; then export "$var=$out"; else unset "$var"; fi
+    done
+    unset APPIMAGE APPDIR ARGV0 OWD
+}
+
+interactive() { [[ -t 0 || -t 2 ]] && { : </dev/tty; } 2>/dev/null; }
+
+ask() {
+    local answer=''
+    printf '%s' "$1" >/dev/tty
+    IFS= read -r answer </dev/tty || true
+    printf '%s' "$answer"
+}
+
+confirm() {
+    if [[ ${ASSUME_YES:-0} == 1 ]]; then return 0; fi
+    if ! interactive; then return 1; fi
+    local answer
+    answer=$(ask "$1 [y/N] ")
+    [[ $answer == [yY]* ]]
+}
+
+# --- config and registry -----------------------------------------------------
+
+load_config() {
+    INSTALL_DIR=$DEFAULT_INSTALL_DIR
+    [[ -f $CONFIG_FILE ]] || return 0
+    local key val
+    while IFS='=' read -r key val; do
+        val=${val%\"} val=${val#\"} val=${val/#\~/$HOME}
+        if [[ $key == INSTALL_DIR && -n $val ]]; then INSTALL_DIR=$val; fi
+    done < <(grep -E '^[A-Za-z_]+=' "$CONFIG_FILE" || true)
+}
+
+reg_file() { printf '%s/%s.json' "$REG_DIR" "$1"; }
+reg_get() { jq -r "$2 // empty" "$(reg_file "$1")"; }
+
+reg_write() {
+    local f
+    f=$(reg_file "$1")
+    mkdir -p "$REG_DIR"
+    printf '%s\n' "$2" >"$f.tmp"
+    mv -f -- "$f.tmp" "$f"
+}
+
+reg_ids() {
+    local f
+    for f in "$REG_DIR"/*.json; do
+        f=${f##*/}
+        printf '%s\n' "${f%.json}"
+    done
+}
+
+require_app() { [[ -f $(reg_file "$1") ]] || die "'$1' is not installed (see $PROG --list)"; }
+
+valid_id() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]{0,63}$ && $1 != all ]]; }
+
+slugify() {
+    local s=${1,,}
+    sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^[-.]+//; s/[-.]+$//' <<<"$s"
+}
+
+# --- AppImage inspection -----------------------------------------------------
+
+hex_bytes() { od -An -tx1 -j "$2" -N "$3" -- "$1" 2>/dev/null | tr -d ' \n'; }
+
+check_appimage() {
+    [[ $(hex_bytes "$1" 0 4) == 7f454c46 ]] || { REASON="not an ELF executable"; return 1; }
+    case $(hex_bytes "$1" 8 3) in
+        414902) return 0 ;;
+        414901) REASON="type 1 AppImages are not supported"; return 1 ;;
+        *) REASON="not an AppImage (no AppImage magic bytes)"; return 1 ;;
+    esac
+}
+
+# Prints the update information embedded in the .upd_info ELF section, if any.
+read_update_info() {
+    local off size
+    read -r off size < <(readelf -S --wide -- "$1" 2>/dev/null |
+        sed -n 's/^.*\] \.upd_info[[:space:]]*//p' | awk '{print $3, $4}') || return 0
+    [[ -n ${off-} && -n ${size-} ]] || return 0
+    dd if="$1" iflag=skip_bytes,count_bytes skip=$((16#$off)) count=$((16#$size)) status=none | tr -d '\0\n'
+}
+
+update_info_supported() {
+    case ${1%%|*} in
+        zsync | gh-releases-zsync | gh-releases-direct | electron-updater) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+desktop_get() {
+    awk -v k="$2" '/^\[/ { s = ($0 == "[Desktop Entry]") }
+        s && index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1"
+}
+
+appimage_extract() { (cd "$1" && "$2" --appimage-extract "$3" >/dev/null 2>&1) || true; }
+
+# Extracts the menu entry and icon of AppImage $1 into directory $2. Sets
+# M_DESKTOP (path, may be empty), M_DESKTOP_NAME, M_NAME, M_VERSION, M_ICON.
+extract_meta() {
+    local app=$1 dest=$2 root=$2/squashfs-root d icon
+    rm -rf -- "$root"
+    appimage_extract "$dest" "$app" '*.desktop'
+    [[ -d $root ]] || { REASON="couldn't extract files from the AppImage"; return 1; }
+
+    M_DESKTOP='' M_DESKTOP_NAME='' M_NAME='' M_VERSION='' M_ICON=''
+    for d in "$root"/*.desktop "$root"/usr/share/applications/*.desktop; do
+        if [[ -f $d ]]; then
+            M_DESKTOP=$d M_DESKTOP_NAME=${d##*/}
+            break
+        fi
+    done
+    if [[ -n $M_DESKTOP ]]; then
+        M_NAME=$(desktop_get "$M_DESKTOP" Name)
+        M_VERSION=$(desktop_get "$M_DESKTOP" X-AppImage-Version)
+        icon=$(desktop_get "$M_DESKTOP" Icon)
+    fi
+    icon=${icon:-${M_DESKTOP_NAME%.desktop}}
+    icon=${icon##*/} icon=${icon%.png} icon=${icon%.svg} icon=${icon%.xpm}
+
+    local pat
+    for pat in '.DirIcon' "$icon.*" "usr/share/icons/hicolor/*/apps/$icon.*" "usr/share/pixmaps/$icon.*"; do
+        appimage_extract "$dest" "$app" "$pat"
+    done
+    M_ICON=$(pick_icon "$root" "$icon")
+}
+
+pick_icon() {
+    local root=$1 n=$2 f best='' size best_size=0
+    for f in "$root/usr/share/icons/hicolor/scalable/apps/$n.svg" "$root/$n.svg"; do
+        if [[ -s $f ]]; then printf '%s' "$f"; return; fi
+    done
+    for f in "$root"/usr/share/icons/hicolor/*/apps/"$n".png; do
+        size=${f%/apps/*} size=${size##*/} size=${size%%x*}
+        if [[ -s $f && $size =~ ^[0-9]+$ ]] && ((size > best_size)); then
+            best=$f best_size=$size
+        fi
+    done
+    if [[ -n $best ]]; then printf '%s' "$best"; return; fi
+    for f in "$root/$n.png" "$root/usr/share/pixmaps/$n.svg" "$root/usr/share/pixmaps/$n.png" \
+        "$root/usr/share/pixmaps/$n.xpm" "$root/.DirIcon"; do
+        if [[ -s $f ]]; then printf '%s' "$f"; return; fi
+    done
+}
+
+# --- menu entry --------------------------------------------------------------
+
+# Rewrites an Exec= value so the app starts through "--run ID", keeping its
+# arguments and any leading "env VAR=value" assignments.
+wrap_exec() {
+    local v=$1 id=$2 prefix='' rest
+    if [[ $v == 'env '* ]]; then
+        prefix=env v=${v#env }
+        while [[ $v =~ ^([A-Za-z_][A-Za-z0-9_]*=[^\ ]*)\ +(.*)$ ]]; do
+            prefix+=" ${BASH_REMATCH[1]}" v=${BASH_REMATCH[2]}
+        done
+        prefix+=' '
+    fi
+    if [[ $v == '"'* ]]; then
+        rest=${v#\"} rest=${rest#*\"}
+    elif [[ $v == *' '* ]]; then
+        rest=" ${v#* }"
+    else
+        rest=''
+    fi
+    printf '%s"%s" --run %s%s' "$prefix" "$SELF" "$id" "$rest"
+}
+
+transform_desktop() {
+    local src=$1 id=$2 icon=$3 line section=''
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        case $line in
+            '['*']')
+                section=$line
+                printf '%s\n' "$line"
+                if [[ $line == '[Desktop Entry]' ]]; then printf 'X-InstallAppImage-Id=%s\n' "$id"; fi
+                continue
+                ;;
+            Exec=*)
+                printf 'Exec=%s\n' "$(wrap_exec "${line#Exec=}" "$id")"
+                continue
+                ;;
+            TryExec=* | X-InstallAppImage-Id=*) continue ;;
+            Icon=*)
+                if [[ $section == '[Desktop Entry]' && -n $icon ]]; then
+                    printf 'Icon=%s\n' "$icon"
+                    continue
+                fi
+                ;;
+        esac
+        printf '%s\n' "$line"
+    done <"$src"
+}
+
+# Installs the icon and menu entry for app $id from the extract_meta results.
+# Sets OUT_DESKTOP and OUT_ICON.
+install_menu_entry() {
+    local id=$1 name=$2 src=$M_DESKTOP ext
+    mkdir -p "$DESKTOP_DIR" "$ICON_DIR"
+    OUT_ICON=''
+    if [[ -n $M_ICON ]]; then
+        case $(file -b -L --mime-type -- "$M_ICON") in
+            image/svg+xml) ext=svg ;;
+            image/png) ext=png ;;
+            image/x-xpixmap) ext=xpm ;;
+            *) ext=png ;;
+        esac
+        rm -f -- "$ICON_DIR/$id".{png,svg,xpm}
+        OUT_ICON=$ICON_DIR/$id.$ext
+        cp -L -- "$M_ICON" "$OUT_ICON"
+    fi
+    if [[ -z $src ]]; then
+        src=$TMP_BASE/$id.generated.desktop
+        printf '[Desktop Entry]\nType=Application\nName=%s\nExec=app %%U\nCategories=Utility;\n' "$name" >"$src"
+    fi
+    OUT_DESKTOP=$DESKTOP_DIR/${M_DESKTOP_NAME:-$id.desktop}
+    transform_desktop "$src" "$id" "$OUT_ICON" >"$OUT_DESKTOP.tmp"
+    mv -f -- "$OUT_DESKTOP.tmp" "$OUT_DESKTOP"
+    if command -v desktop-file-validate >/dev/null && ! desktop-file-validate "$OUT_DESKTOP" >/dev/null 2>&1; then
+        warn "the menu entry has validation warnings (it should still work): $OUT_DESKTOP"
+    fi
+}
+
+refresh_menu() { update-desktop-database -q "$DESKTOP_DIR" 2>/dev/null || true; }
+
+backup_file() {
+    mkdir -p "$BACKUP_DIR"
+    local dest
+    dest=$BACKUP_DIR/${1##*/}.$(date +%Y%m%d-%H%M%S)
+    mv -f -- "$1" "$dest"
+    note "moved $1 to $dest"
+}
+
+# --- GitHub ------------------------------------------------------------------
+
+gh_api() {
+    if [[ -z ${GH_MODE-} ]]; then
+        if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then GH_MODE=gh; else GH_MODE=curl; fi
+    fi
+    if [[ $GH_MODE == gh ]]; then
+        gh api -- "$1"
+    else
+        curl -fsSL --retry 2 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"
+    fi
+}
+
+gh_release() {
+    local owner=$1 repo=$2 tag=${3:-latest}
+    case $tag in
+        latest) gh_api "repos/$owner/$repo/releases/latest" ;;
+        latest-pre | latest-all) gh_api "repos/$owner/$repo/releases?per_page=20" | jq -e '[.[] | select(.draft | not)][0]' ;;
+        *) gh_api "repos/$owner/$repo/releases/tags/$tag" ;;
+    esac
+}
+
+asset_field() {
+    jq -r --arg n "$2" --arg f "$3" 'first(.assets[] | select(.name == $n) | .[$f]) // empty' <<<"$1"
+}
+
+# The release tag whose asset matches sha256 $3 or file name $4, if any.
+find_release_tag() {
+    gh_api "repos/$1/$2/releases?per_page=100" 2>/dev/null |
+        jq -r --arg d "sha256:$3" --arg n "$4" '
+            first(.[] | select(any(.assets[]; .digest == $d)) | .tag_name)
+            // first(.[] | select(any(.assets[]; .name == $n)) | .tag_name) // empty' 2>/dev/null || true
+}
+
+derive_pattern() {
+    local asset=$1 version=${2#v}
+    if [[ -n $version && $asset == *"$version"* ]]; then
+        printf '%s' "${asset/"$version"/*}"
+    else
+        sed -E 's/[0-9]+(\.[0-9]+)+/*/' <<<"$asset"
+    fi
+}
+
+# Builds update information for GitHub repository $1 (owner/repo or a URL),
+# asking which asset to follow. Sets SRC_INFO; on failure sets REASON.
+github_update_info() {
+    local input=$1 owner repo rest rel tag asset pattern i choice
+    local -a candidates
+    input=${input%/} input=${input%.git} input=${input#*://} input=${input#www.} input=${input#github.com/}
+    IFS=/ read -r owner repo rest <<<"$input"
+    if [[ -z $owner || -z $repo ]]; then REASON="'$1' is not a GitHub repository"; return 1; fi
+    if ! rel=$(gh_release "$owner" "$repo" latest 2>/dev/null); then
+        REASON="couldn't find a published release of $owner/$repo"
+        return 1
+    fi
+    tag=$(jq -r .tag_name <<<"$rel")
+    mapfile -t candidates < <(jq -r '.assets[].name' <<<"$rel" | grep -iE '\.appimage$' |
+        grep -viE 'aarch64|arm64|armhf|armv7|i[36]86' || true)
+    case ${#candidates[@]} in
+        0) REASON="the latest release of $owner/$repo ($tag) has no x86_64 AppImage"; return 1 ;;
+        1) asset=${candidates[0]} ;;
+        *)
+            printf 'Release %s of %s/%s has several AppImages:\n' "$tag" "$owner" "$repo" >/dev/tty
+            for i in "${!candidates[@]}"; do printf '  %d) %s\n' $((i + 1)) "${candidates[i]}" >/dev/tty; done
+            while :; do
+                choice=$(ask "Which one is this app? [1-${#candidates[@]}] ")
+                if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#candidates[@]})); then break; fi
+            done
+            asset=${candidates[choice - 1]}
+            ;;
+    esac
+    pattern=$(derive_pattern "$asset" "$tag")
+    if interactive; then
+        printf 'Future releases will be matched with the file name pattern: %s\n' "$pattern" >/dev/tty
+        choice=$(ask "Press Enter to accept it, or type another pattern: ")
+        if [[ -n $choice ]]; then pattern=$choice; fi
+    fi
+    if jq -e --arg n "$asset.zsync" 'any(.assets[]; .name == $n)' <<<"$rel" >/dev/null; then
+        SRC_INFO="gh-releases-zsync|$owner|$repo|latest|$pattern.zsync"
+    else
+        SRC_INFO="gh-releases-direct|$owner|$repo|latest|$pattern"
+    fi
+}
+
+# Turns what the user gave as an update source (GitHub repository or URL, an
+# Electron latest-linux.yml feed, or a .zsync URL) into update information.
+# Sets SRC_INFO; on failure sets REASON.
+source_update_info() {
+    local input=$1
+    case ${input%%\?*} in
+        http*://*.yml | http*://*.yaml)
+            resolve_electron_feed "$input" || return 1
+            note "feed: latest is $T_TAG ($T_ASSET)"
+            SRC_INFO="electron-updater|$input"
+            ;;
+        http*://*.zsync)
+            fetch_zsync_header "$input" || return 1
+            SRC_INFO="zsync|$input"
+            ;;
+        *) github_update_info "$input" ;;
+    esac
+}
+
+# --- update resolution -------------------------------------------------------
+
+fetch_zsync_header() {
+    local url=$1 tmp line
+    Z_SHA1='' Z_LEN='' Z_URL='' Z_FILENAME=''
+    mkdir -p "$TMP_BASE"
+    tmp=$(mktemp "$TMP_BASE/zsync.XXXXXX")
+    if ! curl -fsSL --retry 2 -o "$tmp" -- "$url"; then
+        rm -f -- "$tmp"
+        REASON="couldn't download $url"
+        return 1
+    fi
+    while IFS= read -r line; do
+        line=${line%$'\r'}
+        if [[ -z $line ]]; then break; fi
+        case $line in
+            'SHA-1: '*) Z_SHA1=${line#SHA-1: } ;;
+            'Length: '*) Z_LEN=${line#Length: } ;;
+            'URL: '*) Z_URL=${line#URL: } ;;
+            'Filename: '*) Z_FILENAME=${line#Filename: } ;;
+        esac
+    done < <(head -c 16384 -- "$tmp" | LC_ALL=C sed -n '1,/^$/p' | tr -d '\0')
+    rm -f -- "$tmp"
+    if [[ -z $Z_SHA1 ]]; then REASON="$url is not a valid .zsync file"; return 1; fi
+}
+
+# Works out what the latest build is. Sets T_URL, T_SHA1, T_SHA256, T_SIZE,
+# T_TAG and T_ASSET; on failure sets REASON and returns 1.
+resolve_target() {
+    local kind owner repo tag pattern rel name n zsync_url='' digest
+    T_URL='' T_SHA1='' T_SHA256='' T_SHA512='' T_SIZE='' T_TAG='' T_ASSET=''
+    IFS='|' read -r kind owner repo tag pattern <<<"$1"
+    case $kind in
+        zsync) zsync_url=$owner ;;
+        electron-updater) resolve_electron_feed "${1#electron-updater|}" || return 1 ;;
+        gh-releases-zsync | gh-releases-direct)
+            if ! rel=$(gh_release "$owner" "$repo" "$tag" 2>&1); then
+                REASON="couldn't get release '$tag' of $owner/$repo from GitHub: $(tail -n1 <<<"$rel")"
+                return 1
+            fi
+            T_TAG=$(jq -r '.tag_name // empty' <<<"$rel")
+            name=''
+            while IFS= read -r n; do
+                # shellcheck disable=SC2053 # $pattern is a glob on purpose
+                if [[ $n == $pattern ]]; then name=$n; break; fi
+            done < <(jq -r '.assets[].name' <<<"$rel")
+            if [[ -z $name ]]; then
+                REASON="no file matching '$pattern' in release $T_TAG of $owner/$repo"
+                return 1
+            fi
+            if [[ $kind == gh-releases-zsync ]]; then
+                zsync_url=$(asset_field "$rel" "$name" browser_download_url)
+                name=${name%.zsync}
+            fi
+            T_URL=$(asset_field "$rel" "$name" browser_download_url)
+            if [[ -n $T_URL ]]; then
+                T_ASSET=$name
+                T_SIZE=$(asset_field "$rel" "$name" size)
+                digest=$(asset_field "$rel" "$name" digest)
+                if [[ $digest == sha256:* ]]; then T_SHA256=${digest#sha256:}; fi
+            fi
+            ;;
+        *)
+            REASON="unsupported update information: $1"
+            return 1
+            ;;
+    esac
+    if [[ -n $zsync_url ]]; then
+        fetch_zsync_header "$zsync_url" || return 1
+        T_SHA1=$Z_SHA1 T_SIZE=${Z_LEN:-$T_SIZE} T_ASSET=${T_ASSET:-$Z_FILENAME}
+        if [[ -z $T_URL && -n $Z_URL ]]; then
+            if [[ $Z_URL == http*://* ]]; then T_URL=$Z_URL; else T_URL=${zsync_url%/*}/$Z_URL; fi
+        fi
+    fi
+    if [[ -z $T_URL ]]; then REASON="couldn't work out the download URL"; return 1; fi
+}
+
+# Reads an electron-builder update feed (latest-linux.yml). Sets T_* like
+# resolve_target; the feed's sha512 is base64-encoded.
+resolve_electron_feed() {
+    local url=$1 yml path
+    if ! yml=$(curl -fsSL --retry 2 -- "$url" 2>&1); then
+        REASON="couldn't download the update feed $url: $(tail -n1 <<<"$yml")"
+        return 1
+    fi
+    yml=${yml//$'\r'/}
+    T_TAG=$(yml_top "$yml" version)
+    path=$(yml_top "$yml" path)
+    if [[ -z $path ]]; then
+        path=$(sed -nE "s/^ *- url: *['\"]?([^'\"]*\.AppImage)['\"]? *$/\1/Ip" <<<"$yml" | head -n1)
+    fi
+    if [[ -z $T_TAG || -z $path ]]; then
+        REASON="$url doesn't look like an Electron update feed (no version or AppImage)"
+        return 1
+    fi
+    # The size and sha512 of the files: entry for $path.
+    read -r T_SIZE T_SHA512 < <(awk -v p="$path" '
+        /^ *- url:/ { u = $0; sub(/^ *- url: */, "", u); gsub(/["\047]/, "", u); cur = (u == p) }
+        cur && /^ *size:/ { size = $2 }
+        cur && /^ *sha512:/ { sha = $2 }
+        END { print size, sha }' <<<"$yml") || true
+    T_SHA512=${T_SHA512:-$(yml_top "$yml" sha512)}
+    T_ASSET=$path
+    if [[ $path == http*://* ]]; then T_URL=$path; else T_URL=${url%/*}/$path; fi
+}
+
+yml_top() { sed -nE "s/^$2: *['\"]?([^'\"]*)['\"]? *$/\1/p" <<<"$1" | head -n1; }
+
+sha512_b64() { openssl dgst -sha512 -binary <"$1" | base64 -w0; }
+
+target_label() { printf '%s' "${T_TAG:-${T_ASSET:-a new build}}"; }
+
+# Sets L_SHA1 and L_SHA256 for app $1, reusing the registry's hashes when the
+# file hasn't changed since they were recorded.
+local_hashes() {
+    local f app size mtime
+    f=$(reg_file "$1")
+    app=$(jq -r .appimage "$f")
+    size=$(stat -c %s -- "$app") mtime=$(stat -c %Y -- "$app")
+    L_SHA1='' L_SHA256='' L_SHA512=''
+    if [[ $(jq -r '"\(.installed.size) \(.installed.mtime)"' "$f") == "$size $mtime" ]]; then
+        L_SHA1=$(jq -r '.installed.sha1 // ""' "$f") L_SHA256=$(jq -r '.installed.sha256 // ""' "$f")
+        L_SHA512=$(jq -r '.installed.sha512 // ""' "$f")
+    fi
+    if [[ -z $L_SHA1 ]]; then L_SHA1=$(sha1sum <"$app" | cut -d' ' -f1); fi
+    if [[ -z $L_SHA256 ]]; then L_SHA256=$(sha256sum <"$app" | cut -d' ' -f1); fi
+    if [[ -z $L_SHA512 ]]; then L_SHA512=$(sha512_b64 "$app"); fi
+}
+
+is_current() {
+    if [[ -n $T_SHA1 ]]; then
+        if [[ $T_SHA1 == "$L_SHA1" ]]; then return 0; fi
+        return 1
+    fi
+    if [[ -n $T_SHA256 ]]; then
+        if [[ $T_SHA256 == "$L_SHA256" ]]; then return 0; fi
+        return 1
+    fi
+    if [[ -n $T_SHA512 ]]; then
+        if [[ $T_SHA512 == "$L_SHA512" ]]; then return 0; fi
+        return 1
+    fi
+    if [[ -n $T_TAG && $T_TAG == "$(reg_get "$1" .installed.tag)" && $T_ASSET == "$(reg_get "$1" .installed.asset)" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+record_installed() { # id tag version asset
+    local f app size mtime sha1 sha256 sha512 json
+    f=$(reg_file "$1")
+    app=$(jq -r .appimage "$f")
+    size=$(stat -c %s -- "$app") mtime=$(stat -c %Y -- "$app")
+    sha1=$(sha1sum <"$app" | cut -d' ' -f1) sha256=$(sha256sum <"$app" | cut -d' ' -f1)
+    sha512=$(sha512_b64 "$app")
+    json=$(jq --arg tag "$2" --arg version "$3" --arg asset "$4" --argjson size "$size" \
+        --argjson mtime "$mtime" --arg sha1 "$sha1" --arg sha256 "$sha256" --arg sha512 "$sha512" \
+        --arg now "$(date -Iseconds)" \
+        '.installed = {tag: $tag, version: $version, asset: $asset, size: $size, mtime: $mtime,
+                       sha1: $sha1, sha256: $sha256, sha512: $sha512} | .updated_at = $now' "$f")
+    reg_write "$1" "$json"
+}
+
+mark_pending() {
+    mkdir -p "$PENDING_DIR"
+    jq -nc --arg to "$2" '{to: $to, checked: (now | todate)}' >"$PENDING_DIR/$1"
+}
+
+# --- notifications -----------------------------------------------------------
+
+close_notification() { # nid file
+    local nid
+    [[ -f $1 ]] || return 0
+    nid=$(<"$1")
+    rm -f -- "$1"
+    if [[ $nid =~ ^[0-9]+$ ]]; then
+        gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+            --method org.freedesktop.Notifications.CloseNotification "$nid" >/dev/null 2>&1 || true
+    fi
+}
+
+# Shows a notification, waits until it is clicked or dismissed, and prints the
+# chosen action (empty when dismissed). Timeout is in ms: 0 keeps the popup on
+# screen, "" uses the server's default. DMS only reports a notification as
+# closed when it is dismissed, not when its popup times out into the center.
+# Its id is kept in $NOTIFY_DIR/<kind>-<id>.nid so it can be closed later.
+notify_wait() { # kind id icon timeout summary body [action=Label...]
+    local kind=$1 id=$2 icon=$3 timeout=$4 summary=$5 body=$6 a line nid='' action='' first=1
+    shift 6
+    local -a args=(-a "$NOTIFY_APP" -p -w)
+    if [[ -n $timeout ]]; then args+=(-t "$timeout"); fi
+    local nidf=$NOTIFY_DIR/$kind-$id.nid
+    if [[ -n $icon ]]; then args+=(-i "$icon"); fi
+    for a; do args+=(-A "$a"); done
+    mkdir -p "$NOTIFY_DIR"
+    while IFS= read -r line; do
+        if ((first)); then
+            first=0 nid=$line
+            printf '%s\n' "$nid" >"$nidf"
+        else
+            action=$line
+        fi
+    done < <(notify-send "${args[@]}" -- "$summary" "$body" 2>/dev/null)
+    if [[ -f $nidf && $(<"$nidf") == "$nid" ]]; then rm -f -- "$nidf"; fi
+    printf '%s' "$action"
+}
+
+# Runs "$SELF ARGS..." as transient user unit installappimage-notify-<kind>-<id>
+# (never installappimage-update-<id>, which is the update itself),
+# replacing any notification of the same kind still on screen.
+spawn_notifier() { # kind id args...
+    local kind=$1 id=$2 unit i
+    shift 2
+    unit=installappimage-notify-$kind-$id
+    close_notification "$NOTIFY_DIR/$kind-$id.nid"
+    for i in {1..20}; do
+        systemctl --user is-active --quiet "$unit" || break
+        sleep 0.1
+    done
+    systemctl --user stop "$unit" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+    systemd-run --user --collect --quiet --unit="$unit" -- "$SELF" "$@" >/dev/null 2>&1 ||
+        setsid -f "$SELF" "$@" </dev/null >/dev/null 2>&1
+}
+
+start_update_unit() {
+    local id=$1 out
+    if ! out=$(systemd-run --user --collect --quiet --unit="installappimage-update-$id" -- \
+        "$SELF" --update "$id" --ui auto 2>&1); then
+        if [[ $out == *already* || $out == *exists* ]]; then
+            notify-send -a "$NOTIFY_APP" "$(reg_get "$id" .name) is already being updated" 2>/dev/null || true
+        else
+            notify-send -a "$NOTIFY_APP" "Couldn't start the update of $id" "$out" 2>/dev/null || true
+        fi
+        return 1
+    fi
+}
+
+open_log() {
+    local log=$LOG_DIR/$1.log
+    if command -v ghostty >/dev/null; then
+        ghostty --title="installappimage: $1" -e less -R +G -- "$log"
+    else
+        xdg-open "$log"
+    fi
+}
+
+cmd_notify_update() {
+    local id=$1 name icon to action
+    [[ -f $(reg_file "$id") && -f $PENDING_DIR/$id ]] || return 0
+    name=$(reg_get "$id" .name) icon=$(reg_get "$id" .icon)
+    to=$(jq -r '.to // "a new version"' "$PENDING_DIR/$id")
+    action=$(notify_wait update "$id" "$icon" 0 "$name update available" "Version $to is ready to install." \
+        update="Update now" dismiss="Dismiss")
+    if [[ $action == update ]]; then start_update_unit "$id"; fi
+}
+
+cmd_notify_result() { # id ok|failed message
+    local id=$1 status=$2 message=$3 name icon action
+    name=$(reg_get "$id" .name 2>/dev/null || true) icon=$(reg_get "$id" .icon 2>/dev/null || true)
+    name=${name:-$id}
+    if [[ $status == ok ]]; then
+        local -a args=(-a "$NOTIFY_APP")
+        if [[ -n $icon ]]; then args+=(-i "$icon"); fi
+        notify-send "${args[@]}" -- "$name updated" "$message"
+        return
+    fi
+    action=$(notify_wait result "$id" "$icon" 0 "$name update failed" "$message" log="Show log" retry="Retry")
+    case $action in
+        log) open_log "$id" ;;
+        retry) start_update_unit "$id" ;;
+    esac
+}
+
+# --- update ------------------------------------------------------------------
+
+plugin_available() {
+    command -v dms >/dev/null && [[ $(timeout 3 dms ipc call installappimage ping 2>/dev/null) == ok ]]
+}
+
+progress_write() { # [result] [reason]
+    [[ ${P_ENABLED:-0} == 1 ]] || return 0
+    local tmp=$PROGRESS_DIR/.$P_ID.$BASHPID.tmp logjson='[]'
+    mkdir -p "$PROGRESS_DIR"
+    if ((${#P_LOG[@]})); then logjson=$(printf '%s\n' "${P_LOG[@]: -4}" | jq -R . | jq -sc .); fi
+    jq -nc --arg name "$P_NAME" --arg icon "$P_ICON" --arg to "$P_TO" --arg phase "$P_PHASE" \
+        --argjson "done" "${P_DONE:-0}" --argjson total "${P_TOTAL:-0}" --argjson log "$logjson" \
+        --arg result "${1-}" --arg reason "${2-}" \
+        '{name: $name, icon: $icon, to: $to, phase: $phase, done: $done, total: $total, log: $log,
+          result: (if $result == "" then null else $result end), reason: $reason}' >"$tmp"
+    mv -f -- "$tmp" "$PROGRESS_DIR/$P_ID.json"
+}
+
+step() {
+    P_PHASE=$1
+    P_LOG+=("$1")
+    progress_write
+    info "$1"
+}
+
+monitor_download() {
+    while sleep 0.5; do
+        P_DONE=$(stat -c %s -- "$1" 2>/dev/null || echo 0)
+        progress_write
+    done
+}
+
+notify_result() { # ok|failed message
+    if [[ $UI == tty && $HOLD == 0 ]]; then return 0; fi
+    spawn_notifier result "$P_ID" --_notify-result "$P_ID" "$1" "$2"
+}
+
+fail() {
+    REASON=$1
+    exit 1
+}
+
+# Runs in a subshell: exits non-zero on failure, after reporting it.
+update_one() {
+    local id=$1 f app dir info running=0 new_desktop old_desktop version lockfd
+    f=$(reg_file "$id")
+    app=$(jq -r .appimage "$f") dir=$(jq -r .dir "$f") info=$(jq -r '.update_info // ""' "$f")
+    P_ID=$id P_NAME=$(jq -r .name "$f") P_ICON=$(jq -r '.icon // ""' "$f")
+    P_TO='' P_PHASE='' P_DONE=0 P_TOTAL=0 P_LOG=() P_ENABLED=1
+    REASON='' MON_PID='' PART='' WORK=''
+
+    mkdir -p "$LOCK_DIR" "$LOG_DIR" "$TMP_BASE"
+    exec {lockfd}>"$LOCK_DIR/$id.lock"
+    if ! flock -n "$lockfd"; then
+        warn "$P_NAME is already being updated"
+        return 3
+    fi
+
+    exec 3>&2 4>&1
+    if [[ $UI == tty ]]; then
+        exec > >(tee -- "$LOG_DIR/$id.log") 2>&1
+        TEE_PID=$!
+    else
+        exec >"$LOG_DIR/$id.log" 2>&1
+        TEE_PID=''
+    fi
+    trap '_update_exit $?' EXIT
+    printf '%s%s%s  %s(%s)%s\n' "$C_B" "$P_NAME" "$C_0" "$C_D" "$(date -Iseconds)" "$C_0"
+
+    [[ -n $info ]] || fail "$P_NAME has no update information; reinstall it with --repo OWNER/REPO"
+    [[ -f $app ]] || fail "$app is missing"
+
+    step "Checking for updates"
+    resolve_target "$info" || fail "$REASON"
+    P_TO=$(target_label) P_TOTAL=${T_SIZE:-0}
+    local_hashes "$id"
+    if is_current "$id"; then
+        rm -f -- "$PENDING_DIR/$id"
+        close_notification "$NOTIFY_DIR/update-$id.nid"
+        DONE_MSG="Already up to date ($P_TO)"
+        return 0
+    fi
+
+    step "Downloading $T_ASSET"
+    PART=$dir/.$id.AppImage.part
+    rm -f -- "$PART"
+    monitor_download "$PART" &
+    MON_PID=$!
+    local -a curl_args=(-fL --retry 3 --connect-timeout 20 -o "$PART")
+    if [[ $UI == tty ]]; then curl_args+=(--progress-bar); else curl_args+=(-sS); fi
+    curl "${curl_args[@]}" -- "$T_URL" 2>&3 || fail "download failed: $T_URL"
+    kill "$MON_PID" 2>/dev/null || true
+    wait "$MON_PID" 2>/dev/null || true
+    MON_PID=''
+    P_DONE=$(stat -c %s -- "$PART")
+
+    step "Verifying the download"
+    if [[ -n $T_SIZE && $P_DONE != "$T_SIZE" ]]; then
+        fail "size mismatch: got $P_DONE bytes, expected $T_SIZE"
+    fi
+    if [[ -n $T_SHA1 && $(sha1sum <"$PART" | cut -d' ' -f1) != "$T_SHA1" ]]; then
+        fail "SHA-1 checksum mismatch; the download is corrupted"
+    fi
+    if [[ -n $T_SHA256 && $(sha256sum <"$PART" | cut -d' ' -f1) != "$T_SHA256" ]]; then
+        fail "SHA-256 checksum mismatch; the download is corrupted"
+    fi
+    if [[ -n $T_SHA512 && $(sha512_b64 "$PART") != "$T_SHA512" ]]; then
+        fail "SHA-512 checksum mismatch; the download is corrupted"
+    fi
+    check_appimage "$PART" || fail "the download is $REASON"
+    chmod +x -- "$PART"
+
+    step "Reading the new menu entry"
+    WORK=$(mktemp -d "$TMP_BASE/update.XXXXXX")
+    extract_meta "$PART" "$WORK" || fail "$REASON"
+    local new_target=$DESKTOP_DIR/${M_DESKTOP_NAME:-$id.desktop} owner_id=''
+    if [[ -f $new_target ]]; then owner_id=$(sed -n 's/^X-InstallAppImage-Id=//p' "$new_target" | head -n1); fi
+    if [[ -n $owner_id && $owner_id != "$id" && -f $(reg_file "$owner_id") ]]; then
+        fail "the new version's menu entry ($new_target) belongs to '$owner_id'; is the update source right?"
+    fi
+
+    step "Installing $P_TO"
+    if pgrep -f -- "$(sed 's/[][\.*^$]/\\&/g' <<<"$app")" >/dev/null 2>&1; then running=1; fi
+    mv -f -- "$PART" "$app"
+    PART=''
+    old_desktop=$(jq -r .desktop_file "$f")
+    install_menu_entry "$id" "$P_NAME"
+    new_desktop=$OUT_DESKTOP
+    if [[ -n $old_desktop && $old_desktop != "$new_desktop" ]]; then rm -f -- "$old_desktop"; fi
+    refresh_menu
+    reg_write "$id" "$(jq --arg d "$new_desktop" --arg i "$OUT_ICON" '.desktop_file = $d | .icon = $i' "$f")"
+    version=$M_VERSION
+    record_installed "$id" "$T_TAG" "$version" "$T_ASSET"
+    rm -f -- "$PENDING_DIR/$id"
+    close_notification "$NOTIFY_DIR/update-$id.nid"
+
+    DONE_MSG="Updated to $P_TO."
+    if ((running)); then DONE_MSG+=" Restart $P_NAME to use it."; fi
+}
+
+_update_exit() {
+    local rc=$1
+    trap - EXIT
+    if [[ -n ${MON_PID-} ]]; then kill "$MON_PID" 2>/dev/null || true; fi
+    if [[ -n ${PART-} ]]; then rm -f -- "$PART"; fi
+    if [[ -n ${WORK-} ]]; then rm -rf -- "$WORK"; fi
+    rm -f -- "$PROGRESS_DIR/.$P_ID".*.tmp
+    if ((rc == 0)); then
+        P_PHASE="done"
+        P_LOG+=("$DONE_MSG")
+        printf '%s%s%s\n' "$C_G" "$DONE_MSG" "$C_0"
+        progress_write ok "$DONE_MSG"
+        notify_result ok "$DONE_MSG"
+    else
+        REASON=${REASON:-"unexpected error (${LAST_ERR:-see the log})"}
+        P_LOG+=("Failed: $REASON")
+        printf '%sfailed:%s %s\n' "$C_R" "$C_0" "$REASON"
+        progress_write failed "$REASON"
+        notify_result failed "$REASON"
+    fi
+    # A run in a terminal shows its result there, so the bar entry can go.
+    if [[ $UI == tty && $HOLD == 0 ]]; then rm -f -- "$PROGRESS_DIR/$P_ID.json"; fi
+    exec 1>&4 2>&3
+    if [[ -n ${TEE_PID-} ]]; then wait "$TEE_PID" 2>/dev/null || true; fi
+    exit "$rc"
+}
+
+cmd_update() {
+    local -a ids=() failed=()
+    local id rc all=0
+    UI=auto HOLD=0
+    while (($#)); do
+        case $1 in
+            --ui) UI=${2-}; shift ;;
+            --ui=*) UI=${1#--ui=} ;;
+            --hold) HOLD=1 ;;
+            all) all=1 ;;
+            -*) die "unknown option for --update: $1" ;;
+            *) ids+=("$1") ;;
+        esac
+        shift
+    done
+    case $UI in auto | tty | none) ;; *) die "--ui must be auto, tty or none" ;; esac
+    if ((all)); then
+        mapfile -t ids < <(for id in $(reg_ids); do
+            if [[ -n $(reg_get "$id" .update_info) ]]; then printf '%s\n' "$id"; fi
+        done)
+        if ((${#ids[@]} == 0)); then
+            info "No installed app has update information."
+            return 0
+        fi
+    fi
+    ((${#ids[@]})) || die "usage: $PROG --update ID... | all"
+    for id in "${ids[@]}"; do require_app "$id"; done
+
+    if [[ $UI == auto ]]; then
+        if [[ -t 1 ]]; then
+            UI="tty"
+        elif plugin_available; then
+            UI=none
+        elif command -v ghostty >/dev/null; then
+            exec ghostty --title="Updating AppImages" -e "$SELF" --update "${ids[@]}" --ui tty --hold
+        else
+            UI=none
+        fi
+    fi
+
+    for id in "${ids[@]}"; do
+        set +e
+        (
+            set -e
+            update_one "$id"
+        )
+        rc=$?
+        set -e
+        if ((rc != 0)); then failed+=("$id"); fi
+        if [[ $UI == tty ]]; then echo; fi
+    done
+
+    if [[ $UI == tty && ${#ids[@]} -gt 1 ]]; then
+        if ((${#failed[@]})); then
+            printf '%s%d of %d updates failed:%s %s\n' "$C_R" "${#failed[@]}" "${#ids[@]}" "$C_0" "${failed[*]}"
+        else
+            printf '%sAll %d apps are up to date.%s\n' "$C_G" "${#ids[@]}" "$C_0"
+        fi
+    fi
+    if ((HOLD)); then
+        read -rp "Press Enter to close. " _ || true
+    fi
+    ((${#failed[@]} == 0))
+}
+
+# --- check -------------------------------------------------------------------
+
+cmd_check() {
+    local id info wait_net=0 i
+    if [[ ${1-} == --wait-network ]]; then wait_net=1; fi
+    if ((wait_net)); then
+        for i in {1..60}; do
+            if curl -fsS -o /dev/null --max-time 5 https://api.github.com; then break; fi
+            if ((i == 60)); then die "no network after 2 minutes; skipping the update check"; fi
+            sleep 2
+        done
+    fi
+    for id in $(reg_ids); do
+        info=$(reg_get "$id" .update_info)
+        if [[ -z $info ]]; then continue; fi
+        if ! resolve_target "$info"; then
+            warn "$id: $REASON"
+            continue
+        fi
+        local_hashes "$id"
+        if is_current "$id"; then
+            rm -f -- "$PENDING_DIR/$id"
+            printf '%s: up to date (%s)\n' "$id" "$(target_label)"
+        else
+            mark_pending "$id" "$(target_label)"
+            printf '%s: update available: %s\n' "$id" "$(target_label)"
+        fi
+    done
+}
+
+# --- install -----------------------------------------------------------------
+
+cmd_install() {
+    local src='' dir_override='' id='' repo='' no_update=0
+    while (($#)); do
+        case $1 in
+            --name) id=${2-}; shift ;;
+            --dir) dir_override=${2-}; shift ;;
+            --repo | --update-url) repo=${2-}; shift ;;
+            --no-update-info) no_update=1 ;;
+            -y | --yes) ASSUME_YES=1 ;;
+            -*) die "unknown option: $1" ;;
+            *)
+                [[ -z $src ]] || die "install one AppImage at a time"
+                src=$1
+                ;;
+        esac
+        shift
+    done
+    [[ -n $src ]] || die "no AppImage given (see $PROG --help)"
+    [[ -f $src ]] || die "no such file: $src"
+    src=$(realpath -- "$src")
+    check_appimage "$src" || die "$src: $REASON"
+
+    load_config
+    local base=${dir_override:-$INSTALL_DIR}
+    base=$(realpath -m -- "${base/#\~/$HOME}")
+
+    mkdir -p "$TMP_BASE"
+    WORK=$(mktemp -d "$TMP_BASE/install.XXXXXX")
+    trap 'rm -rf -- "$WORK"' EXIT
+    chmod +x -- "$src"
+    info "Reading ${src##*/}"
+    extract_meta "$src" "$WORK" || die "$REASON"
+    local name=${M_NAME:-$(basename -- "$src" | sed -E 's/\.appimage$//I')}
+    id=${id:-$(slugify "$name")}
+    valid_id "$id" || die "'$id' can't be used as an id; pick one with --name (lowercase letters, digits, . _ -)"
+    note "name: $name, id: $id${M_VERSION:+, version: $M_VERSION}"
+
+    local reinstall=0
+    if [[ -f $(reg_file "$id") ]]; then
+        confirm "$id is already installed. Replace it with this file?" || die "cancelled"
+        reinstall=1
+    fi
+
+    # Menu entries that would clash: same file name, or pointing at this AppImage.
+    local target=$DESKTOP_DIR/${M_DESKTOP_NAME:-$id.desktop} d
+    local -a stale=()
+    if [[ -e $target ]]; then
+        local owner_id
+        owner_id=$(sed -n 's/^X-InstallAppImage-Id=//p' "$target" | head -n1)
+        if [[ -n $owner_id && $owner_id != "$id" && -f $(reg_file "$owner_id") ]]; then
+            die "$name is already installed as '$owner_id' (its menu entry is $target); update or remove that one instead"
+        elif [[ $owner_id != "$id" ]]; then
+            stale+=("$target")
+        fi
+    fi
+    for d in "$DESKTOP_DIR"/*.desktop; do
+        if [[ $d != "$target" ]] && grep -qF -- "$src" "$d" && ! grep -q '^X-InstallAppImage-Id=' "$d"; then
+            stale+=("$d")
+        fi
+    done
+    if ((${#stale[@]})); then
+        warn "these menu entries were not made by $PROG and would clash:"
+        for d in "${stale[@]}"; do note "$d"; done
+        confirm "Move them to $BACKUP_DIR and continue?" || die "cancelled"
+        for d in "${stale[@]}"; do backup_file "$d"; done
+    fi
+
+    # Update information: embedded, from --repo, or asked for.
+    local update_info source=embedded
+    update_info=$(read_update_info "$src")
+    if [[ -n $repo ]]; then
+        source_update_info "$repo" || die "$REASON"
+        update_info=$SRC_INFO source=user
+    elif [[ -z $update_info ]] || ! update_info_supported "$update_info"; then
+        if [[ -n $update_info ]]; then warn "unsupported update information: $update_info"; fi
+        update_info='' source=none
+        if ((no_update == 0)) && interactive; then
+            warn "$name has no update information."
+            while :; do
+                printf 'Where are its updates published? Give a GitHub page (URL or owner/repo),\n' >/dev/tty
+                printf 'an Electron update feed (.../latest-linux.yml) or a .zsync URL.\n' >/dev/tty
+                repo=$(ask "Update source for $name, or Enter to skip: ")
+                if [[ -z $repo ]]; then break; fi
+                if source_update_info "$repo"; then
+                    update_info=$SRC_INFO source=user
+                    break
+                fi
+                warn "$REASON"
+            done
+        fi
+    fi
+    case $source in
+        embedded) note "updates: $update_info (embedded)" ;;
+        user) note "updates: $update_info" ;;
+        none) note "updates: none" ;;
+    esac
+
+    local dir=$base/$id app orig_name=${src##*/}
+    app=$dir/$id.AppImage
+    mkdir -p -- "$dir"
+    if [[ $src != "$app" ]]; then mv -f -- "$src" "$app"; fi
+    note "installed to $app"
+
+    local old_desktop=''
+    if ((reinstall)); then old_desktop=$(reg_get "$id" .desktop_file); fi
+    install_menu_entry "$id" "$name"
+    if [[ -n $old_desktop && $old_desktop != "$OUT_DESKTOP" ]]; then rm -f -- "$old_desktop"; fi
+    refresh_menu
+    note "menu entry: $OUT_DESKTOP"
+
+    local tag='' owner repo_name sha256
+    if [[ $update_info == gh-releases-* ]]; then
+        IFS='|' read -r _ owner repo_name _ <<<"$update_info"
+        sha256=$(sha256sum <"$app" | cut -d' ' -f1)
+        tag=$(find_release_tag "$owner" "$repo_name" "$sha256" "$orig_name")
+    fi
+    reg_write "$id" "$(jq -n --arg id "$id" --arg name "$name" --arg dir "$dir" --arg app "$app" \
+        --arg desktop "$OUT_DESKTOP" --arg icon "$OUT_ICON" --arg info "$update_info" --arg source "$source" \
+        --arg now "$(date -Iseconds)" \
+        '{id: $id, name: $name, dir: $dir, appimage: $app, desktop_file: $desktop, icon: $icon,
+          update_info: $info, update_source: $source, installed_at: $now}')"
+    record_installed "$id" "$tag" "$M_VERSION" "$orig_name"
+    rm -f -- "$PENDING_DIR/$id"
+
+    if [[ ! -f $UNIT_FILE && -z ${IAI_SKIP_SETUP-} ]]; then cmd_setup; fi
+
+    info "Installed $name${tag:+ ($tag)}"
+    if [[ -n $update_info ]]; then
+        if resolve_target "$update_info" && local_hashes "$id"; then
+            if is_current "$id"; then
+                if [[ -z $tag && -n $T_TAG ]]; then
+                    record_installed "$id" "$T_TAG" "$M_VERSION" "$orig_name"
+                    tag=$T_TAG
+                fi
+                note "it is up to date ($(target_label))"
+            else
+                mark_pending "$id" "$(target_label)"
+                note "${C_Y}update available: $(target_label)${C_0}; run: $PROG --update $id"
+            fi
+        else
+            warn "couldn't check for updates: $REASON"
+        fi
+    fi
+}
+
+# --- list / remove -----------------------------------------------------------
+
+cmd_list() {
+    local id f version updates status
+    local -a ids
+    mapfile -t ids < <(reg_ids)
+    if ((${#ids[@]} == 0)); then
+        info "No AppImages installed with $PROG."
+        return 0
+    fi
+    {
+        printf 'ID\tNAME\tVERSION\tUPDATES\tSTATUS\n'
+        for id in "${ids[@]}"; do
+            f=$(reg_file "$id")
+            version=$(jq -r '[.installed.tag, .installed.version] | map(select(. != null and . != "")) | first // "?"' "$f")
+            updates=$(jq -r '.update_info | if . == "" or . == null then "none" else
+                (split("|") as $p | if $p[0] == "zsync" then "zsync"
+                  elif $p[0] == "electron-updater" then "feed:\($p[1] | split("/")[2])"
+                  else "github:\($p[1])/\($p[2])" end) end' "$f")
+            status=''
+            if [[ -f $PROGRESS_DIR/$id.json ]] && [[ $(jq -r '.result // ""' "$PROGRESS_DIR/$id.json") == '' ]]; then
+                status=updating
+            elif [[ -f $PENDING_DIR/$id ]]; then
+                status="update available: $(jq -r .to "$PENDING_DIR/$id")"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$(jq -r .name "$f")" "$version" "$updates" "${status:--}"
+        done
+    } | column -t -s $'\t'
+}
+
+cmd_remove() {
+    local -a ids=()
+    local purge=0 id
+    while (($#)); do
+        case $1 in
+            --purge) purge=1 ;;
+            -y | --yes) ASSUME_YES=1 ;;
+            -*) die "unknown option for --remove: $1" ;;
+            *) ids+=("$1") ;;
+        esac
+        shift
+    done
+    ((${#ids[@]})) || die "usage: $PROG --remove ID... [--purge] [-y]"
+    for id in "${ids[@]}"; do require_app "$id"; done
+    for id in "${ids[@]}"; do remove_one "$id" "$purge"; done
+    refresh_menu
+}
+
+remove_one() {
+    local id=$1 purge=$2 f name dir app desktop icon kind c
+    f=$(reg_file "$id")
+    name=$(jq -r .name "$f") dir=$(jq -r .dir "$f") app=$(jq -r .appimage "$f")
+    desktop=$(jq -r .desktop_file "$f") icon=$(jq -r '.icon // ""' "$f")
+    # Only ever delete the app's own directory.
+    if [[ ${dir##*/} != "$id" || ${app%/*} != "$dir" || $dir == "$HOME" || $dir == / ]]; then
+        die "refusing to delete '$dir': it doesn't look like the directory of $id"
+    fi
+
+    info "Removing $name"
+    note "$dir/"
+    note "$desktop"
+    if [[ -n $icon ]]; then note "$icon"; fi
+    confirm "Remove $name?" || {
+        note "skipped"
+        return 0
+    }
+
+    systemctl --user stop "installappimage-update-$id" >/dev/null 2>&1 || true
+    for kind in update result; do
+        systemctl --user stop "installappimage-notify-$kind-$id" >/dev/null 2>&1 || true
+        close_notification "$NOTIFY_DIR/$kind-$id.nid"
+    done
+    rm -rf -- "$dir"
+    rm -f -- "$desktop" "$PENDING_DIR/$id" "$PROGRESS_DIR/$id.json" "$LOG_DIR/$id.log" "$LOCK_DIR/$id.lock" "$f"
+    if [[ -n $icon ]]; then rm -f -- "$icon"; fi
+    note "removed"
+
+    ((purge)) || return 0
+    if ! interactive; then
+        warn "--purge needs a terminal to confirm each directory; skipped"
+        return 0
+    fi
+    local -A seen=()
+    local n
+    for n in "$name" "${name,,}" "$id"; do
+        for c in "$HOME/.config/$n" "$HOME/.local/share/$n" "$HOME/.cache/$n" "$HOME/.$n"; do
+            if [[ -d $c && -z ${seen[$c]-} ]]; then
+                seen[$c]=1
+                if ASSUME_YES=0 confirm "Delete $c?"; then rm -rf -- "$c"; fi
+            fi
+        done
+    done
+}
+
+# --- run / config / setup ----------------------------------------------------
+
+cmd_run() {
+    local id=${1-} app
+    [[ -n $id ]] || die "usage: $PROG --run ID [ARGS...]"
+    shift
+    if [[ ! -f $(reg_file "$id") ]]; then
+        notify-send -a "$NOTIFY_APP" "Can't start $id" "It is not installed with $PROG." 2>/dev/null || true
+        exit 1
+    fi
+    app=$(reg_get "$id" .appimage)
+    if [[ ! -x $app ]]; then
+        notify-send -a "$NOTIFY_APP" "Can't start $id" "$app is missing." 2>/dev/null || true
+        exit 1
+    fi
+    if [[ -f $PENDING_DIR/$id ]]; then
+        (spawn_notifier update "$id" --_notify-update "$id") </dev/null >/dev/null 2>&1 &
+        disown
+    fi
+    exec "$app" "$@"
+}
+
+cmd_config() {
+    load_config
+    case ${1-} in
+        '')
+            printf 'install_dir = %s\n' "$INSTALL_DIR"
+            printf '(config file: %s)\n' "$CONFIG_FILE"
+            ;;
+        install_dir)
+            [[ -n ${2-} ]] || die "usage: $PROG --config install_dir DIR"
+            local dir
+            dir=$(realpath -m -- "${2/#\~/$HOME}")
+            mkdir -p -- "${CONFIG_FILE%/*}"
+            {
+                if [[ -f $CONFIG_FILE ]]; then grep -v '^INSTALL_DIR=' "$CONFIG_FILE" || true; fi
+                printf 'INSTALL_DIR=%s\n' "$dir"
+            } >"$CONFIG_FILE.tmp"
+            mv -f -- "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            info "New apps will be installed under $dir (installed apps stay where they are)"
+            ;;
+        *) die "unknown setting '$1' (available: install_dir)" ;;
+    esac
+}
+
+cmd_setup() {
+    mkdir -p -- "${UNIT_FILE%/*}"
+    cat >"$UNIT_FILE" <<EOF
+[Unit]
+Description=Check AppImages installed with installappimage.sh for updates
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart="$SELF" --check --wait-network
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --quiet "$UNIT_NAME"
+    info "Update check enabled at login ($UNIT_NAME)"
+    if [[ -f $PLUGIN_DIR/plugin.json ]]; then
+        note "DMS plugin found: updates show their progress in the bar"
+    else
+        note "DMS plugin not found in $PLUGIN_DIR; updates will open in Ghostty"
+    fi
+}
+
+# --- main --------------------------------------------------------------------
+
+main() {
+    sanitize_env
+    case ${1-} in
+        -h | --help) usage ;;
+        -l | --list) cmd_list ;;
+        -r | --remove) shift; cmd_remove "$@" ;;
+        -u | --update) shift; cmd_update "$@" ;;
+        -c | --check) shift; cmd_check "$@" ;;
+        --run) shift; cmd_run "$@" ;;
+        --config) shift; cmd_config "$@" ;;
+        --setup) cmd_setup ;;
+        --_notify-update) cmd_notify_update "$2" ;;
+        --_notify-result) cmd_notify_result "$2" "$3" "$4" ;;
+        '') usage >&2; exit 1 ;;
+        -*) die "unknown option: $1 (see $PROG --help)" ;;
+        *) cmd_install "$@" ;;
+    esac
+}
+
+main "$@"

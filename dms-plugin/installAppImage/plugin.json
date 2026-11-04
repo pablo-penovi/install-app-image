@@ -1,0 +1,16 @@
+{
+    "id": "installAppImage",
+    "name": "AppImage Updates",
+    "description": "Progress of AppImage updates run by installappimage.sh",
+    "version": "0.1.0",
+    "author": "pablo",
+    "type": "composite",
+    "capabilities": ["daemon", "dankbar-widget"],
+    "icon": "system_update_alt",
+    "components": {
+        "daemon": "./Daemon.qml",
+        "widget": "./Widget.qml"
+    },
+    "requires_dms": ">=1.5.0",
+    "permissions": ["process"]
+}
