@@ -1,53 +1,93 @@
 # install-app-image
 
-`installappimage.sh` installs AppImages with a menu entry, keeps track of them, and keeps them up to date. It can list and remove the apps it installed, and it checks for updates at login. When an app with an update is launched, a notification offers to update it, and the update's progress shows in the DankMaterialShell (DMS) bar.
+`installappimage` installs AppImages with a menu entry, keeps track of them, and keeps them up to date. It can list and remove the apps it installed, and it checks for updates at login. When an app with an update is launched, a notification offers to update it, and the update's progress shows in the DankMaterialShell (DMS) bar.
+
+It supports [Niri](https://github.com/YaLTeR/niri) with [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) only.
+
+## Why use it
+
+- **Simple:**
+  - **Everything is plain text you can inspect.** The tool is one Bash script and a small DMS plugin. Each app gets one directory, one menu entry and one small JSON record.
+  - **No new package format, store or database.** The AppImages themselves aren't modified.
+- **Lightweight:**
+  - **Nothing runs in the background.** Updates are checked once at login by a short systemd job.
+  - **No extra processes when idle.** Progress is shown by the shell you already run.
+  - **No new dependencies to speak of:** it uses tools that are normally already installed, like `curl`, `jq` and `notify-send`.
+- **Easy to use:**
+  - **Install:** one command, `installappimage Foo.AppImage`. It sets up the menu entry and icon, and finds where updates come from or asks you once.
+  - **Updates:** you hear about an update when you open the app, and one click installs it with progress in the bar.
+  - **Install and remove the tool:** a guided `./install.sh` sets it up. `./install.sh --uninstall` removes it and leaves your apps working.
 
 ## What it does
 
-- **Install:** moves the AppImage to `~/Applications/<id>/<id>.AppImage` (the base directory can be changed) and extracts its menu entry and icon. The menu entry starts the app through `installappimage.sh --run <id>`.
+- **Install:** moves the AppImage to `~/Applications/<id>/<id>.AppImage` (the base directory can be changed) and extracts its menu entry and icon. The menu entry starts the app through `installappimage --run <id>`.
 - **Update info:** reads the update information embedded in the AppImage. If there is none, it asks where updates are published: a GitHub repository, an Electron update feed (`latest-linux.yml`) or a `.zsync` URL.
 - **Login check:** a systemd user service checks every app for updates when you log in.
 - **Launch:** if an update is available, launching the app shows a notification with **Update now** and **Dismiss**. Clicking **Update now**, or the notification itself, starts the update.
-- **Progress:** a DMS bar plugin shows each update's progress, current step and log lines, with **Retry** on failures. Without the plugin, updates open in a Ghostty window instead.
+- **Progress:** a DMS bar plugin shows each update's progress, current step and log lines, with **Retry** on failures. Without the plugin, updates open in a terminal window instead.
 - **When it ends:** a notification reports the result. A failure includes the reason, with **Show log** and **Retry** buttons. Once every update has succeeded, the bar pill disappears after 3 seconds.
 
 ## Requirements
 
-- **Required:** bash, coreutils, util-linux (`flock`, `setsid`), `jq`, `curl`, binutils (`readelf`), `file`, `openssl`, desktop-file-utils, libnotify (`notify-send`), glib2 (`gdbus`), and systemd (user session).
-- **Optional:**
-  - `gh`: GitHub API calls use it when logged in, which allows more requests per hour.
-  - DankMaterialShell 1.5 or later: needed for the bar plugin.
-  - `ghostty`: used for updates when the plugin isn't available, and for **Show log**.
+- **Session:** Niri, with DankMaterialShell 1.5 or later running, and a systemd user session.
+- **Packages** (Arch names): bash 5.1 or later, coreutils, util-linux, jq, curl, binutils, file, openssl, desktop-file-utils, libnotify, glib2, systemd, procps-ng, gawk, sed and grep.
+- **Optional:** `gh`, logged in. GitHub API calls use it, which allows more requests per hour.
+- **A terminal:** used for update progress when the bar plugin isn't loaded, and for **Show log**. Ghostty, foot, kitty, Alacritty, WezTerm, GNOME Terminal and Console are supported, and anything that takes `-e COMMAND`.
 
-## Setup
+## Installing
 
 ```sh
-install -Dm755 installappimage.sh ~/.local/bin/installappimage.sh
-
-# DMS plugin
-mkdir -p ~/.config/DankMaterialShell/plugins
-cp -r dms-plugin/installAppImage ~/.config/DankMaterialShell/plugins/
-dms ipc call plugin-scan scan
-dms ipc call plugins enable installAppImage
-
-# login update check (also done automatically by the first install)
-installappimage.sh --setup
+git clone https://github.com/pablo-penovi/install-app-image.git
+cd install-app-image
+./install.sh
 ```
 
-Then add **AppImage Updates** to the bar in DMS Settings → Dank Bar. The pill stays hidden while no update is running or waiting to be cleared.
+`install.sh` first checks the session and the dependencies. If anything is missing, it lists all of it, prints the `pacman` command to install the missing packages, and stops without changing anything.
+
+Then it asks five questions. Press Enter to accept the default in brackets:
+
+| Question | Default |
+|---|---|
+| Where should the `installappimage` command go? | `~/.local/bin` |
+| Where should AppImages be installed? | `~/Applications` |
+| Terminal for update progress (without the bar plugin) and logs? | `$TERMINAL`, else the first of ghostty, foot, kitty, alacritty and wezterm found |
+| Copy the files, or link them to this checkout? | `copy` |
+| Check for updates when you log in? | `y` |
+
+After a summary and confirmation, it does the following:
+
+1. Installs the command and the DMS plugin, either as copies or as symlinks to the checkout. Symlinks make edits in the checkout take effect immediately.
+2. Writes the config.
+3. Points existing menu entries at the command.
+4. Sets up the login check.
+5. Enables and reloads the plugin in DMS.
+
+If the bar doesn't have the **AppImage Updates** widget yet, add it in DMS Settings → Dank Bar. The pill stays hidden while no update is running or waiting to be cleared.
+
+Running `./install.sh` again upgrades in place. The current settings become the defaults.
+
+### Uninstalling
+
+```sh
+./install.sh --uninstall
+```
+
+This removes the command, the DMS plugin, the login check and the config. It keeps your AppImages, their menu entries, and the registry and state under `~/.local/share` and `~/.local/state`. The menu entries are rewritten to start the AppImages directly, so they keep working, and reinstalling picks everything up again.
 
 ## Usage
 
 ```sh
-installappimage.sh ~/Downloads/Foo-1.2.3-x86_64.AppImage   # install
-installappimage.sh Foo.AppImage --repo owner/repo           # updates from GitHub releases
-installappimage.sh Foo.AppImage --update-url https://example.com/linux/latest-linux.yml
-installappimage.sh --list
-installappimage.sh --update foo bar                         # or: --update all
-installappimage.sh --remove foo [--purge] [-y]
-installappimage.sh --check
-installappimage.sh --config install_dir ~/Apps
-installappimage.sh --help
+installappimage ~/Downloads/Foo-1.2.3-x86_64.AppImage   # install
+installappimage Foo.AppImage --repo owner/repo           # updates from GitHub releases
+installappimage Foo.AppImage --update-url https://example.com/linux/latest-linux.yml
+installappimage --list
+installappimage --update foo bar                         # or: --update all
+installappimage --remove foo [--purge] [-y]
+installappimage --check
+installappimage --config                                 # show settings
+installappimage --config install_dir ~/Apps
+installappimage --config terminal foot
+installappimage --help
 ```
 
 **Install options:**
@@ -61,7 +101,7 @@ installappimage.sh --help
 | `--no-update-info` | Don't ask for an update source. |
 | `-y` | Don't ask before replacing menu entries that weren't made by this script. They are backed up first. |
 
-**Update options:** `--ui auto` (the default) shows progress in the terminal when run from one. Otherwise it uses the DMS plugin if it's loaded, then a Ghostty window. `--ui tty` and `--ui none` force a mode.
+**Update options:** `--ui auto` (the default) shows progress in the terminal when run from one. Otherwise it uses the DMS plugin if it's loaded, then a window of the configured terminal. `--ui tty` and `--ui none` force a mode.
 
 `--remove --purge` also offers to delete the app's data directories (`~/.config/<Name>` and similar), asking about each one.
 
@@ -82,7 +122,7 @@ installappimage.sh --help
 
 | Path | Contents |
 |---|---|
-| `~/.config/installappimage/config` | `INSTALL_DIR=…` |
+| `~/.config/installappimage/config` | `INSTALL_DIR`, `TERMINAL`, and `SCRIPT` (the command's path, which the plugin uses for **Retry**) |
 | `~/.local/share/installappimage/apps/<id>.json` | Registry: paths, update source, installed version and hashes |
 | `~/.local/share/applications/<name>.desktop` | Menu entry, marked with `X-InstallAppImage-Id=<id>` |
 | `~/.local/share/icons/installappimage/<id>.*` | Icon |
@@ -98,7 +138,7 @@ installappimage.sh --help
 
 `dms-plugin/installAppImage` is a composite plugin with two parts:
 
-- **Daemon:** watches `~/.local/state/installappimage/progress/` and shares its contents with the bar widget. It also registers `dms ipc call installappimage ping|toggle|status`.
+- **Daemon:** watches `~/.local/state/installappimage/progress/` and shares its contents with the bar widget. It also reads the command's path from the config, and registers `dms ipc call installappimage ping|toggle|status|script`.
 - **Bar widget:** a pill showing the overall percentage. Its panel lists each update with a progress bar, the current step, bytes downloaded and the last log lines. Failed updates get **Retry**, and **Clear finished** removes finished entries.
 
 `toggle` opens or closes the panel, so it can be bound to a key.

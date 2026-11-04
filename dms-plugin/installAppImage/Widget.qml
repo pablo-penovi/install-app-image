@@ -45,7 +45,14 @@ PluginComponent {
         return n.toFixed(i ? 1 : 0) + " " + u[i];
     }
 
-    readonly property string updaterPath: Quickshell.env("HOME") + "/.local/bin/installappimage.sh"
+    PluginGlobalVar {
+        id: scriptVar
+        varName: "script"
+        defaultValue: ""
+    }
+
+    // Set by "installappimage --setup"; falls back to finding it on PATH.
+    readonly property string updaterPath: scriptVar.value || "installappimage"
 
     // Starts the update as a transient user unit so it outlives the shell;
     // systemd-run refuses a second unit with the same name, which doubles as

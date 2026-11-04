@@ -1,7 +1,7 @@
 {
     "id": "installAppImage",
     "name": "AppImage Updates",
-    "description": "Progress of AppImage updates run by installappimage.sh",
+    "description": "Progress of AppImage updates run by installappimage",
     "version": "0.1.0",
     "author": "pablo",
     "type": "composite",

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# installappimage.sh: install AppImages with a menu entry, list and remove
-# them, and keep them up to date. Run with --help for usage.
+# installappimage: install AppImages with a menu entry, list and remove them,
+# and keep them up to date. Run with --help for usage; install.sh in the
+# repository installs it.
 #
 # Where things live:
-#   config    $XDG_CONFIG_HOME/installappimage/config         (INSTALL_DIR=...)
+#   config    $XDG_CONFIG_HOME/installappimage/config         (INSTALL_DIR, TERMINAL, SCRIPT)
 #   registry  $XDG_DATA_HOME/installappimage/apps/<id>.json   (one per app)
 #   apps      $INSTALL_DIR/<id>/<id>.AppImage                  (default ~/Applications)
 #   state     $XDG_STATE_HOME/installappimage/
@@ -14,13 +15,15 @@
 #
 # The DMS plugin "installAppImage" (~/.config/DankMaterialShell/plugins/)
 # renders progress/<id>.json in the bar. Without it, updates started from a
-# notification run in a Ghostty window instead.
+# notification run in a terminal window instead.
 
 set -Eeuo pipefail
 shopt -s nullglob
 trap 'LAST_ERR="line $LINENO: $BASH_COMMAND"' ERR
 
-SELF=$(realpath -- "${BASH_SOURCE[0]}")
+# Absolute, but not resolved: when installed as a symlink, menu entries and
+# the config must name the symlink, not its target.
+SELF=$(realpath -s -- "${BASH_SOURCE[0]}")
 readonly SELF PROG=${0##*/}
 
 : "${HOME:?HOME is not set}"
@@ -67,9 +70,11 @@ Usage:
   $PROG --update ID... | all [--ui auto|tty|none]
                                   update some or all apps
   $PROG --check                   check every app for updates (run at login)
-  $PROG --config [install_dir DIR]
-                                  show the config, or set where apps are installed
-  $PROG --setup                   install and enable the login update check
+  $PROG --config [install_dir DIR | terminal COMMAND]
+                                  show the config, or change a setting
+  $PROG --setup [--no-login-check]
+                                  point menu entries at this script and enable
+                                  (or disable) the login update check
 
 Install options:
   --name ID          id for the app (default: its name, lowercased)
@@ -83,7 +88,7 @@ Install options:
 
 Update options:
   --ui auto   show progress in this terminal, else in the DMS bar plugin,
-              else in a new Ghostty window (default)
+              else in a new terminal window (default)
   --ui tty    print progress here
   --ui none   no terminal output; progress goes to the DMS plugin and the log
 EOF
@@ -131,13 +136,56 @@ confirm() {
 # --- config and registry -----------------------------------------------------
 
 load_config() {
-    INSTALL_DIR=$DEFAULT_INSTALL_DIR
-    [[ -f $CONFIG_FILE ]] || return 0
-    local key val
-    while IFS='=' read -r key val; do
-        val=${val%\"} val=${val#\"} val=${val/#\~/$HOME}
-        if [[ $key == INSTALL_DIR && -n $val ]]; then INSTALL_DIR=$val; fi
-    done < <(grep -E '^[A-Za-z_]+=' "$CONFIG_FILE" || true)
+    INSTALL_DIR=$DEFAULT_INSTALL_DIR TERMINAL_CMD=''
+    if [[ -f $CONFIG_FILE ]]; then
+        local key val
+        while IFS='=' read -r key val; do
+            val=${val%\"} val=${val#\"} val=${val/#\~/$HOME}
+            if [[ -z $val ]]; then continue; fi
+            case $key in
+                INSTALL_DIR) INSTALL_DIR=$val ;;
+                TERMINAL) TERMINAL_CMD=$val ;;
+            esac
+        done < <(grep -E '^[A-Za-z_]+=' "$CONFIG_FILE" || true)
+    fi
+    if [[ -z $TERMINAL_CMD ]]; then TERMINAL_CMD=$(detect_terminal); fi
+}
+
+detect_terminal() {
+    local t
+    for t in "${TERMINAL-}" ghostty foot kitty alacritty wezterm; do
+        if [[ -n $t ]] && command -v "${t%% *}" >/dev/null; then
+            printf '%s' "$t"
+            return
+        fi
+    done
+}
+
+set_config() { # KEY value
+    mkdir -p -- "${CONFIG_FILE%/*}"
+    {
+        if [[ -f $CONFIG_FILE ]]; then grep -v "^$1=" "$CONFIG_FILE" || true; fi
+        printf '%s=%s\n' "$1" "$2"
+    } >"$CONFIG_FILE.tmp"
+    mv -f -- "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
+# Runs a command in a new window of the configured terminal; exec's into it.
+run_in_terminal() { # title command...
+    local title=$1 term
+    shift
+    load_config
+    term=$TERMINAL_CMD
+    [[ -n $term ]] || die "no terminal configured or found (set one with: $PROG --config terminal COMMAND)"
+    case ${term##*/} in
+        ghostty) exec "$term" --title="$title" -e "$@" ;;
+        alacritty) exec "$term" --title "$title" -e "$@" ;;
+        foot) exec "$term" --title="$title" "$@" ;;
+        kitty) exec "$term" --title "$title" "$@" ;;
+        wezterm) exec "$term" start -- "$@" ;;
+        gnome-terminal | kgx) exec "$term" --title="$title" -- "$@" ;;
+        *) exec "$term" -e "$@" ;;
+    esac
 }
 
 reg_file() { printf '%s/%s.json' "$REG_DIR" "$1"; }
@@ -684,8 +732,9 @@ start_update_unit() {
 
 open_log() {
     local log=$LOG_DIR/$1.log
-    if command -v ghostty >/dev/null; then
-        ghostty --title="installappimage: $1" -e less -R +G -- "$log"
+    load_config
+    if [[ -n $TERMINAL_CMD ]]; then
+        run_in_terminal "installappimage: $1" less -R +G -- "$log"
     else
         xdg-open "$log"
     fi
@@ -919,8 +968,8 @@ cmd_update() {
             UI="tty"
         elif plugin_available; then
             UI=none
-        elif command -v ghostty >/dev/null; then
-            exec ghostty --title="Updating AppImages" -e "$SELF" --update "${ids[@]}" --ui tty --hold
+        elif load_config && [[ -n $TERMINAL_CMD ]]; then
+            run_in_terminal "Updating AppImages" "$SELF" --update "${ids[@]}" --ui tty --hold
         else
             UI=none
         fi
@@ -1107,7 +1156,8 @@ cmd_install() {
     record_installed "$id" "$tag" "$M_VERSION" "$orig_name"
     rm -f -- "$PENDING_DIR/$id"
 
-    if [[ ! -f $UNIT_FILE && -z ${IAI_SKIP_SETUP-} ]]; then cmd_setup; fi
+    # First use without install.sh: do its setup (install.sh records SCRIPT).
+    if ! grep -q '^SCRIPT=' "$CONFIG_FILE" 2>/dev/null && [[ -z ${IAI_SKIP_SETUP-} ]]; then cmd_setup; fi
 
     info "Installed $name${tag:+ ($tag)}"
     if [[ -n $update_info ]]; then
@@ -1249,29 +1299,74 @@ cmd_config() {
     case ${1-} in
         '')
             printf 'install_dir = %s\n' "$INSTALL_DIR"
+            printf 'terminal    = %s\n' "${TERMINAL_CMD:-(none found)}"
             printf '(config file: %s)\n' "$CONFIG_FILE"
             ;;
         install_dir)
             [[ -n ${2-} ]] || die "usage: $PROG --config install_dir DIR"
             local dir
             dir=$(realpath -m -- "${2/#\~/$HOME}")
-            mkdir -p -- "${CONFIG_FILE%/*}"
-            {
-                if [[ -f $CONFIG_FILE ]]; then grep -v '^INSTALL_DIR=' "$CONFIG_FILE" || true; fi
-                printf 'INSTALL_DIR=%s\n' "$dir"
-            } >"$CONFIG_FILE.tmp"
-            mv -f -- "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            set_config INSTALL_DIR "$dir"
             info "New apps will be installed under $dir (installed apps stay where they are)"
             ;;
-        *) die "unknown setting '$1' (available: install_dir)" ;;
+        terminal)
+            [[ -n ${2-} ]] || die "usage: $PROG --config terminal COMMAND"
+            command -v "$2" >/dev/null || die "'$2' is not an installed command"
+            set_config TERMINAL "$2"
+            info "Updates and logs will open in $2 when they need a window"
+            ;;
+        *) die "unknown setting '$1' (available: install_dir, terminal)" ;;
     esac
 }
 
+# Points the Exec lines of every managed menu entry at this script, or, with
+# "detach", straight at the AppImage (used when uninstalling the script).
+relink_menu_entries() { # [detach]
+    local id f desktop app new line pre post
+    for id in $(reg_ids); do
+        f=$(reg_file "$id")
+        desktop=$(jq -r '.desktop_file // ""' "$f") app=$(jq -r .appimage "$f")
+        [[ -f $desktop ]] || continue
+        if [[ ${1-} == detach ]]; then new="\"$app\""; else new="\"$SELF\" --run $id"; fi
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line == Exec=*"\" --run $id" || $line == Exec=*"\" --run $id "* ]]; then
+                pre=${line%%\"*} post=${line#*\" --run "$id"}
+                line=$pre$new$post
+            elif [[ $line == Exec=*"\"$app\""* ]]; then
+                # Detached by an earlier uninstall: starts the AppImage directly.
+                pre=${line%%\"$app\"*} post=${line#*\"$app\"}
+                line=$pre$new$post
+            fi
+            printf '%s\n' "$line"
+        done <"$desktop" >"$desktop.tmp"
+        mv -f -- "$desktop.tmp" "$desktop"
+    done
+    refresh_menu
+}
+
 cmd_setup() {
+    local login_check=1
+    case ${1-} in
+        '') ;;
+        --no-login-check) login_check=0 ;;
+        *) die "unknown option for --setup: $1" ;;
+    esac
+    # The DMS plugin reads SCRIPT to start updates (its Retry button).
+    set_config SCRIPT "$SELF"
+    relink_menu_entries
+    if ((login_check == 0)); then
+        if [[ -f $UNIT_FILE ]]; then
+            systemctl --user disable --quiet "$UNIT_NAME" 2>/dev/null || true
+            rm -f -- "$UNIT_FILE"
+            systemctl --user daemon-reload
+        fi
+        info "Login update check disabled"
+        return 0
+    fi
     mkdir -p -- "${UNIT_FILE%/*}"
     cat >"$UNIT_FILE" <<EOF
 [Unit]
-Description=Check AppImages installed with installappimage.sh for updates
+Description=Check AppImages installed with installappimage for updates
 After=graphical-session.target
 
 [Service]
@@ -1289,7 +1384,7 @@ EOF
     if [[ -f $PLUGIN_DIR/plugin.json ]]; then
         note "DMS plugin found: updates show their progress in the bar"
     else
-        note "DMS plugin not found in $PLUGIN_DIR; updates will open in Ghostty"
+        note "DMS plugin not found in $PLUGIN_DIR; updates will open in a terminal"
     fi
 }
 
@@ -1305,7 +1400,8 @@ main() {
         -c | --check) shift; cmd_check "$@" ;;
         --run) shift; cmd_run "$@" ;;
         --config) shift; cmd_config "$@" ;;
-        --setup) cmd_setup ;;
+        --setup) shift; cmd_setup "$@" ;;
+        --_detach-menu) relink_menu_entries detach ;;
         --_notify-update) cmd_notify_update "$2" ;;
         --_notify-result) cmd_notify_result "$2" "$3" "$4" ;;
         '') usage >&2; exit 1 ;;

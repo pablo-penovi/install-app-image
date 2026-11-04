@@ -7,13 +7,26 @@ import qs.Services
 import qs.Modules.Plugins
 
 // Watches $XDG_STATE_HOME/installappimage/progress/*.json (one file per app,
-// written by installappimage.sh) and publishes them as the "apps" global var.
+// written by installappimage) and publishes them as the "apps" global var.
+// Also publishes the script's path ("script") from its config file.
 PluginComponent {
     id: root
 
     property var popoutService: null
     readonly property string progressDir: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/installappimage/progress"
+    readonly property string configFile: (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config") + "/installappimage/config"
     property var apps: ({})
+
+    FileView {
+        path: root.configFile
+        watchChanges: true
+        onFileChanged: reload()
+        onLoaded: {
+            const m = text().match(/^SCRIPT=(.*)$/m);
+            PluginService.setGlobalVar(root.pluginId, "script", m ? m[1].trim() : "");
+        }
+        onLoadFailed: PluginService.setGlobalVar(root.pluginId, "script", "")
+    }
 
     function publish() {
         PluginService.setGlobalVar(root.pluginId, "apps", Object.assign({}, root.apps));
@@ -97,6 +110,10 @@ PluginComponent {
 
         function status(): string {
             return JSON.stringify(root.apps);
+        }
+
+        function script(): string {
+            return PluginService.getGlobalVar(root.pluginId, "script", "");
         }
     }
 }
