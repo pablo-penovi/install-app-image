@@ -126,12 +126,18 @@ ask() {
     printf '%s' "$answer"
 }
 
+# confirm QUESTION [y|n]: the second argument is the answer Enter gives (n by default).
 confirm() {
     if [[ ${ASSUME_YES:-0} == 1 ]]; then return 0; fi
     if ! interactive; then return 1; fi
     local answer
-    answer=$(ask "$1 [y/N] ")
-    [[ $answer == [yY]* ]]
+    if [[ ${2:-n} == y ]]; then
+        answer=$(ask "$1 [Y/n] ")
+        [[ $answer != [nN]* ]]
+    else
+        answer=$(ask "$1 [y/N] ")
+        [[ $answer == [yY]* ]]
+    fi
 }
 
 # --- config and registry -----------------------------------------------------
@@ -1108,7 +1114,7 @@ cmd_install() {
     if ((${#stale[@]})); then
         warn "these menu entries were not made by $PROG and would clash:"
         for d in "${stale[@]}"; do note "$d"; done
-        confirm "Move them to $BACKUP_DIR and continue?" || die "cancelled"
+        confirm "Move them to $BACKUP_DIR and continue?" y || die "cancelled"
         for d in "${stale[@]}"; do backup_file "$d"; done
     fi
 

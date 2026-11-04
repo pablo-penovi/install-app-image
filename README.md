@@ -20,7 +20,7 @@ It supports [Niri](https://github.com/YaLTeR/niri) with [DankMaterialShell](http
 
 ## What it does
 
-- **Install:** moves the AppImage to `~/Applications/<id>/<id>.AppImage` (the base directory can be changed) and extracts its menu entry and icon. The menu entry starts the app through `installappimage --run <id>`.
+- **Install:** moves the AppImage to `~/Applications/<id>/<id>.AppImage` (the base directory can be changed) and extracts its menu entry and icon. The menu entry starts the app through `installappimage --run <id>`. If menu entries that weren't made by this script would clash with it, it offers to move them to a backup and use its own. Pressing Enter accepts.
 - **Update info:** reads the update information embedded in the AppImage. If there is none, it asks where updates are published: a GitHub repository, an Electron update feed (`latest-linux.yml`) or a `.zsync` URL.
 - **Update checks:** each app is checked for updates every time it starts, in the background, so the app isn't slowed down. A systemd user service also checks every app when you log in.
 - **Launch:** if an update is available, a notification with **Update now** and **Dismiss** appears when the app starts, or as soon as the check finds the update. Clicking **Update now**, or the notification itself, starts the update. It appears on every launch until the app is updated, but an open one isn't duplicated.
