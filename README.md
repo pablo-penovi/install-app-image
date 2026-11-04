@@ -2,7 +2,7 @@
 
 `installappimage` installs AppImages with a menu entry, keeps track of them, and keeps them up to date. It can list and remove the apps it installed, and it checks for updates at login. When an app with an update is launched, a notification offers to update it, and the update's progress shows in the DankMaterialShell (DMS) bar.
 
-It supports [Niri](https://github.com/YaLTeR/niri) with [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) only.
+It supports [Niri](https://github.com/YaLTeR/niri) with [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) only. You're welcomed to adapt it to your own setup, the repo is under MIT license.
 
 ## Why use it
 
