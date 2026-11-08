@@ -73,7 +73,11 @@ PluginComponent {
         model: folder
         delegate: FileView {
             required property string filePath
-            required property string fileBaseName
+            required property string fileName
+            // Not the model's fileBaseName: that stops at the first dot, so
+            // "knossos.net.json" would become "knossos" and clearing would
+            // remove a file that doesn't exist.
+            readonly property string fileBaseName: fileName.replace(/\.json$/, "")
             path: filePath
             watchChanges: true
             onFileChanged: reload()
