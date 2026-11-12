@@ -87,6 +87,7 @@ installappimage --check
 installappimage --config                                 # show settings
 installappimage --config install_dir ~/Apps
 installappimage --config terminal foot
+installappimage --setup [--no-login-check]               # repoint menu entries, toggle the login check
 installappimage --help
 ```
 
@@ -102,6 +103,8 @@ installappimage --help
 | `-y` | Don't ask before replacing menu entries that weren't made by this script. They are backed up first. |
 
 **Update options:** `--ui auto` (the default) shows progress in the terminal when run from one. Otherwise it uses the DMS plugin if it's loaded, then a window of the configured terminal. `--ui tty` and `--ui none` force a mode.
+
+`--setup` points every menu entry at the command and enables the login check, or disables it with `--no-login-check`. `install.sh` runs it for you.
 
 `--remove --purge` also offers to delete the app's data directories (`~/.config/<Name>` and similar), asking about each one.
 
