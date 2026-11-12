@@ -41,6 +41,21 @@ PluginComponent {
         return keys.length > 0 && keys.every(k => root.apps[k].result === "ok");
     }
 
+    // Deletes the progress files of the given apps (see the FileViews below
+    // for why they stop watching first).
+    function retire(keys) {
+        const files = [];
+        for (const key of keys) {
+            const view = root.views[key];
+            if (view) {
+                view.watchChanges = false;
+                files.push(view.path);
+            }
+        }
+        if (files.length > 0)
+            Quickshell.execDetached(["rm", "-f"].concat(files));
+    }
+
     // Once every update has finished successfully, clear them after a moment;
     // the widget then closes its panel and hides the pill. A running or
     // failed update keeps everything on screen.
@@ -48,10 +63,18 @@ PluginComponent {
         id: autoClear
         interval: 3000
         onTriggered: {
-            if (!root.allSucceeded())
-                return;
-            const files = Object.keys(root.apps).map(k => root.progressDir + "/" + k + ".json");
-            Quickshell.execDetached(["rm", "-f"].concat(files));
+            if (root.allSucceeded())
+                root.retire(Object.keys(root.apps));
+        }
+    }
+
+    // The widget's "Clear finished" bumps clearSeq; the files are deleted
+    // here, where their FileViews live.
+    Connections {
+        target: PluginService
+        function onGlobalVarChanged(pluginId, varName) {
+            if (pluginId === root.pluginId && varName === "clearSeq")
+                root.retire(Object.keys(root.apps).filter(k => !!root.apps[k].result));
         }
     }
 
@@ -69,33 +92,65 @@ PluginComponent {
         showHidden: false
     }
 
+    // One FileView per progress file, keyed by app id. Quickshell aborts,
+    // taking DMS down, if a FileView is destroyed while its background read
+    // fails. Such a read starts when a watched file is deleted, or when the
+    // folder model lags and reports a file that is already gone. So the folder
+    // model's delegates don't hold FileViews: they create one, and on release
+    // it stops watching and is destroyed seconds later, after any read ends.
+    property var views: ({})
+
     Instantiator {
         model: folder
-        delegate: FileView {
+        delegate: QtObject {
             required property string filePath
             required property string fileName
             // Not the model's fileBaseName: that stops at the first dot, so
             // "knossos.net.json" would become "knossos" and clearing would
             // remove a file that doesn't exist.
-            readonly property string fileBaseName: fileName.replace(/\.json$/, "")
-            path: filePath
+            readonly property string key: fileName.replace(/\.json$/, "")
+            property var view: null
+            Component.onCompleted: {
+                view = progressView.createObject(root, {
+                    "key": key,
+                    "path": filePath
+                });
+                root.views[key] = view;
+            }
+            Component.onDestruction: {
+                view.released = true;
+                view.watchChanges = false;
+                view.destroy(5000);
+                // A new FileView for the same file may already have taken over.
+                if (root.views[key] !== view)
+                    return;
+                delete root.views[key];
+                const next = Object.assign({}, root.apps);
+                delete next[key];
+                root.apps = next;
+                root.publish();
+            }
+        }
+    }
+
+    Component {
+        id: progressView
+        FileView {
+            property string key: ""
+            property bool released: false
             watchChanges: true
             onFileChanged: reload()
             onLoaded: {
+                if (released)
+                    return;
                 try {
                     const next = Object.assign({}, root.apps);
-                    next[fileBaseName] = JSON.parse(text());
+                    next[key] = JSON.parse(text());
                     root.apps = next;
                     root.publish();
                 } catch (e) {
                     // Partial write; the next change event brings the full file.
                 }
-            }
-            Component.onDestruction: {
-                const next = Object.assign({}, root.apps);
-                delete next[fileBaseName];
-                root.apps = next;
-                root.publish();
             }
         }
     }

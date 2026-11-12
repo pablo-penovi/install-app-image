@@ -21,6 +21,12 @@ PluginComponent {
         defaultValue: 0
     }
 
+    PluginGlobalVar {
+        id: clearVar
+        varName: "clearSeq"
+        defaultValue: 0
+    }
+
     readonly property var appList: Object.keys(appsVar.value || {}).sort().map(k => Object.assign({ key: k }, appsVar.value[k]))
     readonly property var running: appList.filter(a => !a.result)
     readonly property bool anyFailed: appList.some(a => a.result === "failed")
@@ -283,11 +289,11 @@ PluginComponent {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
+                        // The daemon deletes the files: it has to stop watching
+                        // them first (see retire() in Daemon.qml).
                         onClicked: {
-                            const dir = (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/installappimage/progress/";
-                            const files = root.appList.filter(a => !!a.result).map(a => dir + a.key + ".json");
                             pop.closePopout();
-                            Quickshell.execDetached(["rm", "-f"].concat(files));
+                            clearVar.set((clearVar.value || 0) + 1);
                         }
                     }
                 }
