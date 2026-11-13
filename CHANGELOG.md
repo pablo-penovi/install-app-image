@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- Animated GIFs in the README showing the update notification, the bar pill and the progress panel.
+
 ## 2026-11-12
 
 ### Added

@@ -27,6 +27,14 @@ It supports [Niri](https://github.com/YaLTeR/niri) with [DankMaterialShell](http
 - **Progress:** a DMS bar plugin shows each update's progress, current step and log lines, with **Retry** on failures. Without the plugin, updates open in a terminal window instead.
 - **When it ends:** a notification reports the result. A failure includes the reason, with **Show log** and **Retry** buttons. Once every update has succeeded, the bar pill disappears after 3 seconds.
 
+**Update available:** when an app starts and a newer version exists, a notification offers the update. Once an update starts, the bar pill shows its progress.
+
+![The "Paseo update available" notification with Update now and Dismiss, followed by the bar pill counting up as the update downloads](docs/notification.gif)
+
+**Progress panel:** clicking the pill opens a panel with each update's progress, step and log lines. When every update has succeeded, the entries are cleared after 3 seconds and the pill disappears.
+
+![The progress panel with two updates downloading, verifying and installing, then clearing itself as the pill disappears](docs/progress.gif)
+
 ## Requirements
 
 - **Session:** Niri, with DankMaterialShell 1.5 or later running, and a systemd user session.
